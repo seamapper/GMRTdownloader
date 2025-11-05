@@ -1052,20 +1052,6 @@ class GMRTGrabber(QWidget):
         aoi_group = QGroupBox("Area of Interest")
         aoi_form = QFormLayout()
 
-        # Ocean selection dropdown
-        # This allows users to quickly select predefined ocean boundaries
-        self.ocean_combo = QComboBox()
-        self.ocean_combo.addItem("Default")
-        self.ocean_combo.addItem("Custom")  # Default option for manual coordinates
-        self.ocean_combo.addItems([
-            "Atlantic",
-            "Indian",
-            "Pacific East",
-            "Pacific West"
-        ])
-        self.ocean_combo.currentTextChanged.connect(self.on_ocean_selected)
-        aoi_form.addRow("Region", self.ocean_combo)
-
         # Geographic boundary controls (longitude/latitude)
         # These spin boxes allow users to set the exact geographic bounds
         # for the bathymetry data they want to download
@@ -1086,14 +1072,14 @@ class GMRTGrabber(QWidget):
 
         # Southern boundary (minimum latitude)
         self.south_spin = QDoubleSpinBox()
-        self.south_spin.setRange(-90, 90)   # Valid latitude range
+        self.south_spin.setRange(-85, 85)   # Valid latitude range (GMRT data limit)
         self.south_spin.setDecimals(6)      # 6 decimal places for precision
         self.south_spin.valueChanged.connect(self.update_map_preview)  # Auto-update map
         aoi_form.addRow("South (min lat)", self.south_spin)
 
         # Northern boundary (maximum latitude)
         self.north_spin = QDoubleSpinBox()
-        self.north_spin.setRange(-90, 90)   # Valid latitude range
+        self.north_spin.setRange(-85, 85)   # Valid latitude range (GMRT data limit)
         self.north_spin.setDecimals(6)      # 6 decimal places for precision
         self.north_spin.valueChanged.connect(self.update_map_preview)  # Auto-update map
         aoi_form.addRow("North (max lat)", self.north_spin)
@@ -1158,6 +1144,14 @@ class GMRTGrabber(QWidget):
         )
         tiling_form.addRow(self.tile_checkbox)
         
+        # Tile size parameter
+        self.tile_size_combo = QComboBox()
+        self.tile_size_combo.addItems(["1", "2", "3", "4"])
+        self.tile_size_combo.setCurrentText("2")  # Default to 2 degrees
+        self.tile_size_combo.setToolTip(
+            "Size of each tile in degrees (applies when tiling is enabled)"
+        )
+        tiling_form.addRow("Tile Size (deg)", self.tile_size_combo)
 
         # Mosaic tiles option
         # When enabled, automatically assemble all tiles into a single GeoTIFF
@@ -1191,21 +1185,8 @@ class GMRTGrabber(QWidget):
         self.south_spin.valueChanged.connect(self.update_tile_checkbox_availability)
         self.north_spin.valueChanged.connect(self.update_tile_checkbox_availability)
         
-        # Initialize tile checkbox state will be called again after tile size is created
-
-        # Tile size parameter
-        self.tile_size_spin = QDoubleSpinBox()
-        self.tile_size_spin.setRange(1, 50)  # Arbitrary allowed tile size range
-        self.tile_size_spin.setSingleStep(1)
-        self.tile_size_spin.setDecimals(2)
-        self.tile_size_spin.setValue(3)  # Default to 3 degrees
-        self.tile_size_spin.setToolTip(
-            "Size of each tile in degrees (applies when tiling is enabled)"
-        )
-        form_layout.addRow("Tile Size (deg)", self.tile_size_spin)
-
-        # React to tile size changes and run initial availability check now that control exists
-        self.tile_size_spin.valueChanged.connect(self.update_tile_checkbox_availability)
+        # React to tile size changes and run initial availability check
+        self.tile_size_combo.currentTextChanged.connect(self.update_tile_checkbox_availability)
         self.update_tile_checkbox_availability()
 
         # Complete the grid parameters section
@@ -1356,8 +1337,8 @@ class GMRTGrabber(QWidget):
         # Set default coordinates for a sample area
         self.west_spin.setValue(-180.0)   # Western boundary
         self.east_spin.setValue(180.0)    # Eastern boundary
-        self.south_spin.setValue(-80.0)   # Southern boundary (changed from -85.0)
-        self.north_spin.setValue(85.0)    # Northern boundary
+        self.south_spin.setValue(-85.0)   # Southern boundary (GMRT data limit)
+        self.north_spin.setValue(85.0)    # Northern boundary (GMRT data limit)
         self.west_spin.blockSignals(False)
         self.east_spin.blockSignals(False)
         self.south_spin.blockSignals(False)
@@ -1532,17 +1513,22 @@ class GMRTGrabber(QWidget):
             lon_span = east - west
             lat_span = north - south
             
-            # Use configured tile size if available, otherwise default to 3.0 degrees
+            # Use configured tile size if available, otherwise default to 2.0 degrees
             try:
-                tile_size = float(self.tile_size_spin.value())
+                tile_size = float(self.tile_size_combo.currentText())
             except Exception:
-                tile_size = 3.0
+                tile_size = 2.0
             
             # Enable tiling if grid is larger than tile size in any dimension
             should_enable_tiling = (lon_span > tile_size) or (lat_span > tile_size)
             
             # Update checkbox state
             self.tile_checkbox.setEnabled(should_enable_tiling)
+            
+            # Automatically check the checkbox if area is larger than tile size
+            if should_enable_tiling and not self.tile_checkbox.isChecked():
+                self.tile_checkbox.setChecked(True)
+                self.log_message(f"Tiling automatically enabled: Grid area ({lon_span:.1f}° x {lat_span:.1f}°) is larger than tile size ({tile_size} degrees)")
             
             # If tiling is disabled and currently checked, uncheck it
             if not should_enable_tiling and self.tile_checkbox.isChecked():
@@ -1641,11 +1627,11 @@ class GMRTGrabber(QWidget):
             overlap = self.calculate_overlap_from_resolution()
             self.log_message(f"Auto-calculated overlap: {overlap:.6f} degrees (2 cells at {self.mres_combo.currentText()}m resolution)")
         
-        # Calculate tile size from UI if available, else default to 3.0 degrees
+        # Calculate tile size from UI if available, else default to 2.0 degrees
         try:
-            tile_size = float(self.tile_size_spin.value())
+            tile_size = float(self.tile_size_combo.currentText())
         except Exception:
-            tile_size = 3.0
+            tile_size = 2.0
         
         # Generate longitude tiles (without overlap applied yet)
         lon_tiles = []
@@ -1704,13 +1690,13 @@ class GMRTGrabber(QWidget):
                 if padded_east < 180.0:
                     padded_east = min(padded_east + overlap, 180.0)
                 
-                # South edge: only add overlap if not at -90°
-                if padded_south > -90.0:
-                    padded_south = max(padded_south - overlap, -90.0)
+                # South edge: only add overlap if not at -85° (GMRT data limit)
+                if padded_south > -85.0:
+                    padded_south = max(padded_south - overlap, -85.0)
                 
-                # North edge: only add overlap if not at 90°
-                if padded_north < 90.0:
-                    padded_north = min(padded_north + overlap, 90.0)
+                # North edge: only add overlap if not at 85° (GMRT data limit)
+                if padded_north < 85.0:
+                    padded_north = min(padded_north + overlap, 85.0)
                 
                 tiles.append({
                     'west': padded_west,
@@ -1793,6 +1779,27 @@ class GMRTGrabber(QWidget):
             self.download_btn.setEnabled(True)
             QMessageBox.warning(self, "Invalid Coordinates", 
                               f"North coordinate ({north}) must be greater than South coordinate ({south}).\n\n"
+                              f"Please correct the coordinates and try again.")
+            return
+        
+        # Validate latitude range (GMRT data limit)
+        if south < -85.0 or south > 85.0:
+            self.log_message(f"Error: South latitude ({south}) must be between -85° and 85°")
+            self.status_label.setText("Error: South latitude out of range")
+            self.download_btn.setText("Download Grid")
+            self.download_btn.setEnabled(True)
+            QMessageBox.warning(self, "Invalid Coordinates", 
+                              f"South latitude ({south}°) must be between -85° and 85° (GMRT data limit).\n\n"
+                              f"Please correct the coordinates and try again.")
+            return
+        
+        if north < -85.0 or north > 85.0:
+            self.log_message(f"Error: North latitude ({north}) must be between -85° and 85°")
+            self.status_label.setText("Error: North latitude out of range")
+            self.download_btn.setText("Download Grid")
+            self.download_btn.setEnabled(True)
+            QMessageBox.warning(self, "Invalid Coordinates", 
+                              f"North latitude ({north}°) must be between -85° and 85° (GMRT data limit).\n\n"
                               f"Please correct the coordinates and try again.")
             return
         
@@ -2547,29 +2554,6 @@ class GMRTGrabber(QWidget):
         self.download_btn.setEnabled(False)  # Disable button during download
         self.download_single_grid(params, file_name, self.on_single_download_finished)
 
-    def on_ocean_selected(self, ocean_name):
-        """
-        Set the coordinate bounds based on the selected ocean.
-        """
-        # Bounds: (west, east, south, north)
-        ocean_bounds = {
-            "Default":  (-180.0, 180.0, -70.0, 70.0),
-            "Atlantic":  (-80.0, 20.0, -60.0, 70.0),   # Approximate
-            "Indian":    (20.0, 120.0, -60.0, 30.0),    # Approximate
-            "Pacific East":  (120.0, 180.0, -60.0, 65.0), # Pacific East
-            "Pacific West":  (-180.0, -80.0, -60.0, 65.0) # Pacific West
-        }
-        if ocean_name in ocean_bounds:
-            west, east, south, north = ocean_bounds[ocean_name]
-            # Handle Pacific wrap-around
-            if east > 180:
-                east = east - 360
-            self.west_spin.setValue(west)
-            self.east_spin.setValue(east)
-            self.south_spin.setValue(south)
-            self.north_spin.setValue(north)
-        # If "Custom" is selected, do nothing (user can set manually)
-
     def on_rectangle_selected(self, bounds):
         print(f"[DEBUG] on_rectangle_selected called with bounds: {bounds}")
         # Block signals to prevent multiple update_map_preview calls
@@ -2608,7 +2592,7 @@ class GMRTGrabber(QWidget):
         self.north_spin.blockSignals(True)
         self.west_spin.setValue(-180.0)
         self.east_spin.setValue(180.0)
-        self.south_spin.setValue(-80.0)
+        self.south_spin.setValue(-85.0)
         self.north_spin.setValue(85.0)
         self.west_spin.blockSignals(False)
         self.east_spin.blockSignals(False)
