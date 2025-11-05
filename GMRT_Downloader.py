@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QFormLayout, QCheckBox, QTextEdit, QSplitter, QFrame
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QUrl, QRect, QPoint
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QIcon
 import requests
 import numpy as np
 import shutil
@@ -922,6 +922,13 @@ class GMRTGrabber(QWidget):
         super().__init__()
         self.setWindowTitle(f"GMRT Bathymetry Grid Downloader v{__version__} - pjohnson@ccom.unh.edu")
         print("[DEBUG] Set window title")
+        # Set window icon
+        icon_path = os.path.join(os.path.dirname(__file__), "media", "GMRT-logo2020.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+            print(f"[DEBUG] Set window icon: {icon_path}")
+        else:
+            print(f"[DEBUG] Icon file not found: {icon_path}")
         # Data structures for managing tiled downloads
         self.tiles_to_download = []        # List of tile boundaries to download
         self.current_tile_index = 0        # Current tile being downloaded

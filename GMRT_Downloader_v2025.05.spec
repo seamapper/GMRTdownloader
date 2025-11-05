@@ -42,5 +42,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['media\\mgds.ico'],
+    icon=['media\\GMRT-logo2020.ico'],
 )
