@@ -140,20 +140,207 @@ class MosaicWorker(QThread):
     finished = pyqtSignal(bool, str)  # success, result
     
     def __init__(self, downloaded_tile_files, download_dir, layer_type,
-                 overlap_spin, west_spin, south_spin,
-                 east_spin, north_spin, delete_tiles_checkbox, split_checkbox):
+                 west_spin, south_spin,
+                 east_spin, north_spin, delete_tiles_checkbox, split_checkbox, format_type=None):
         super().__init__()
         self.downloaded_tile_files = downloaded_tile_files
         self.download_dir = download_dir
         self.layer_type = layer_type
-        self.overlap_spin = overlap_spin
         self.west_spin = west_spin
         self.south_spin = south_spin
         self.east_spin = east_spin
         self.north_spin = north_spin
         self.delete_tiles_checkbox = delete_tiles_checkbox
         self.split_checkbox = split_checkbox
+        self.format_type = format_type
         self.mosaic_path = None
+    
+    def _open_raster_file(self, tile_file):
+        """
+        Open a raster file (GeoTIFF, NetCDF, etc.) using rasterio.
+        Handles different file formats appropriately.
+        
+        Args:
+            tile_file (str): Path to the raster file
+            
+        Returns:
+            rasterio.DatasetReader: Opened dataset or None if failed
+        """
+        try:
+            # Try opening with rasterio - it should auto-detect format
+            dataset = rasterio.open(tile_file)
+            return dataset
+        except Exception as e1:
+            print(f"[DEBUG] Failed to open {tile_file} with default driver: {e1}")
+            # If it's a NetCDF file, try explicitly with NetCDF driver
+            if tile_file.lower().endswith('.nc'):
+                try:
+                    print(f"[DEBUG] Trying NetCDF driver for {os.path.basename(tile_file)}")
+                    dataset = rasterio.open(tile_file, driver='NetCDF')
+                    return dataset
+                except Exception as e2:
+                    print(f"[DEBUG] Failed to open NetCDF file with NetCDF driver: {e2}")
+                    # Try alternative NetCDF access patterns using GDAL virtual dataset syntax
+                    # GMRT NetCDF files might need subdataset specification
+                    gdal_patterns = [
+                        f'NETCDF:"{tile_file}":z',           # Try 'z' variable (common for elevation)
+                        f'NETCDF:"{tile_file}":elevation',   # Try 'elevation' variable
+                        f'NETCDF:"{tile_file}":topo',        # Try 'topo' variable
+                        f'NETCDF:"{tile_file}":bathy',       # Try 'bathy' variable
+                        f'NETCDF:"{tile_file}"',             # Try without subdataset
+                    ]
+                    
+                    for gdal_path in gdal_patterns:
+                        try:
+                            print(f"[DEBUG] Trying GDAL path: {gdal_path}")
+                            dataset = rasterio.open(gdal_path)
+                            print(f"[DEBUG] Successfully opened with pattern: {gdal_path}")
+                            return dataset
+                        except Exception as e3:
+                            print(f"[DEBUG] Failed with pattern {gdal_path}: {e3}")
+                            continue
+                    
+                    # If all GDAL patterns fail, try using netCDF4 to read and create a temporary GeoTIFF
+                    if netCDF4 is not None:
+                        try:
+                            print(f"[DEBUG] Attempting NetCDF4-based conversion for {os.path.basename(tile_file)}")
+                            return self._open_netcdf_with_netcdf4(tile_file)
+                        except Exception as e4:
+                            print(f"[DEBUG] NetCDF4 conversion also failed: {e4}")
+                    
+                    print(f"[DEBUG] All NetCDF open attempts failed for {tile_file}")
+                    return None
+            return None
+    
+    def _open_netcdf_with_netcdf4(self, tile_file):
+        """
+        Open a NetCDF file using netCDF4 library and convert to rasterio-compatible format.
+        This is a fallback when direct rasterio opening fails.
+        
+        Args:
+            tile_file (str): Path to the NetCDF file
+            
+        Returns:
+            rasterio.DatasetReader: Opened dataset or raises exception
+        """
+        import numpy as np
+        import tempfile
+        
+        # Open NetCDF file
+        nc = netCDF4.Dataset(tile_file, 'r')
+        
+        # Find the data variable (usually 2D or 3D)
+        data_var = None
+        for var_name in nc.variables:
+            var = nc.variables[var_name]
+            if len(var.dimensions) >= 2:
+                data_var = var_name
+                break
+        
+        if data_var is None:
+            nc.close()
+            raise Exception("No 2D data variable found in NetCDF file")
+        
+        # Read the data (handle 3D arrays by taking first slice if needed)
+        data = nc.variables[data_var][:]
+        if len(data.shape) == 3:
+            data = data[0, :, :]  # Take first band if 3D
+        
+        # Get coordinate variables
+        dims = nc.variables[data_var].dimensions
+        lat_var = None
+        lon_var = None
+        
+        for dim in dims:
+            if dim in nc.variables:
+                var = nc.variables[dim]
+                if hasattr(var, 'standard_name'):
+                    if 'lat' in var.standard_name.lower():
+                        lat_var = dim
+                    elif 'lon' in var.standard_name.lower():
+                        lon_var = dim
+        
+        # Fallback: try common names
+        if lat_var is None:
+            for name in ['lat', 'latitude', 'y']:
+                if name in nc.variables:
+                    lat_var = name
+                    break
+        if lon_var is None:
+            for name in ['lon', 'longitude', 'x']:
+                if name in nc.variables:
+                    lon_var = name
+                    break
+        
+        if lat_var is None or lon_var is None:
+            nc.close()
+            raise Exception("Could not find latitude/longitude variables in NetCDF file")
+        
+        # Get coordinates
+        lats = nc.variables[lat_var][:]
+        lons = nc.variables[lon_var][:]
+        
+        # Calculate transform
+        lat_min, lat_max = float(lats.min()), float(lats.max())
+        lon_min, lon_max = float(lons.min()), float(lons.max())
+        
+        # Calculate pixel size
+        if len(lats) > 1:
+            lat_res = abs(float(lats[1] - lats[0]))
+        else:
+            lat_res = abs(float(lat_max - lat_min))
+        
+        if len(lons) > 1:
+            lon_res = abs(float(lons[1] - lons[0]))
+        else:
+            lon_res = abs(float(lon_max - lon_min))
+        
+        # Create transform
+        from rasterio.transform import from_bounds
+        transform = from_bounds(lon_min, lat_min, lon_max, lat_max, 
+                               data.shape[1], data.shape[0])
+        
+        # Get CRS if available
+        crs = None
+        if hasattr(nc, 'crs') or hasattr(nc, 'spatial_ref'):
+            try:
+                import rasterio.crs
+                # Try to get CRS from global attributes
+                if hasattr(nc, 'crs_wkt'):
+                    crs = rasterio.crs.CRS.from_wkt(nc.crs_wkt)
+                elif hasattr(nc, 'epsg'):
+                    crs = rasterio.crs.CRS.from_epsg(int(nc.epsg))
+            except:
+                pass
+        
+        if crs is None:
+            crs = rasterio.crs.CRS.from_epsg(4326)  # Default to WGS84
+        
+        # Create a temporary GeoTIFF
+        temp_tiff = tempfile.NamedTemporaryFile(suffix='.tif', delete=False)
+        temp_tiff.close()
+        
+        # Write data to temporary GeoTIFF
+        with rasterio.open(
+            temp_tiff.name, 'w',
+            driver='GTiff',
+            height=data.shape[0],
+            width=data.shape[1],
+            count=1,
+            dtype=data.dtype,
+            crs=crs,
+            transform=transform,
+            nodata=nc.variables[data_var]._FillValue if hasattr(nc.variables[data_var], '_FillValue') else None
+        ) as dst:
+            dst.write(data, 1)
+        
+        nc.close()
+        
+        # Open the temporary GeoTIFF with rasterio
+        dataset = rasterio.open(temp_tiff.name)
+        # Store temp file path so we can clean it up later
+        dataset._temp_file = temp_tiff.name
+        return dataset
     
     def run(self):
         try:
@@ -212,7 +399,10 @@ class MosaicWorker(QThread):
                 if os.path.exists(tile_file):
                     try:
                         print(f"[DEBUG] Opening tile {i+1}/{len(self.downloaded_tile_files)}: {os.path.basename(tile_file)}")
-                        dataset = rasterio.open(tile_file)
+                        dataset = self._open_raster_file(tile_file)
+                        if dataset is None:
+                            print(f"[DEBUG] Failed to open tile {tile_file}")
+                            continue
                         datasets.append(dataset)
                         bounds_list.append(dataset.bounds)
                         
@@ -225,6 +415,8 @@ class MosaicWorker(QThread):
                         
                     except Exception as e:
                         print(f"[DEBUG] Error reading tile {tile_file}: {str(e)}")
+                        import traceback
+                        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
                         continue
             
             if not datasets:
@@ -236,18 +428,23 @@ class MosaicWorker(QThread):
             print("[DEBUG] Using rasterio for mosaicking")
             self.progress.emit("Using rasterio for mosaicking...")
             
+            fallback_datasets = []
             try:
                 # Reopen datasets for rasterio fallback
                 print("[DEBUG] Reopening datasets for rasterio fallback...")
-                fallback_datasets = []
                 for tile_file in self.downloaded_tile_files:
                     if os.path.exists(tile_file):
                         try:
-                            dataset = rasterio.open(tile_file)
+                            dataset = self._open_raster_file(tile_file)
+                            if dataset is None:
+                                print(f"[DEBUG] Failed to reopen tile {tile_file}")
+                                continue
                             fallback_datasets.append(dataset)
                             print(f"[DEBUG] Reopened tile: {os.path.basename(tile_file)}")
                         except Exception as e:
                             print(f"[DEBUG] Error reopening tile {tile_file}: {str(e)}")
+                            import traceback
+                            print(f"[DEBUG] Traceback: {traceback.format_exc()}")
                             continue
                 
                 if fallback_datasets:
@@ -264,6 +461,23 @@ class MosaicWorker(QThread):
             except Exception as fallback_error:
                 print(f"[DEBUG] Rasterio fallback failed: {str(fallback_error)}")
                 self.finished.emit(False, f"Rasterio fallback also failed: {str(fallback_error)}")
+            finally:
+                # Clean up fallback_datasets if they weren't handled by _mosaic_with_rasterio_fallback
+                # (This handles the case where exception occurs before calling the fallback function)
+                for dataset in fallback_datasets:
+                    try:
+                        temp_file = None
+                        if hasattr(dataset, '_temp_file'):
+                            temp_file = dataset._temp_file
+                        dataset.close()
+                        if temp_file and os.path.exists(temp_file):
+                            try:
+                                os.remove(temp_file)
+                                print(f"[DEBUG] Cleaned up temporary file: {temp_file}")
+                            except:
+                                pass
+                    except:
+                        pass
             
         except Exception as e:
             import traceback
@@ -291,17 +505,39 @@ class MosaicWorker(QThread):
             
             for i, dataset in enumerate(datasets):
                 transform = dataset.transform
+                bounds = dataset.bounds
                 print(f"[DEBUG] Tile {i+1} transform: {transform}")
+                print(f"[DEBUG] Tile {i+1} bounds: {bounds}")
+                print(f"[DEBUG] Tile {i+1} CRS: {dataset.crs}")
+                print(f"[DEBUG] Tile {i+1} size: {dataset.width} x {dataset.height}")
+                
+                # Get cell size from transform (units depend on CRS - degrees for geographic, meters for projected)
+                # Note: transform[4] is typically negative for geographic CRS (y-axis points down in image space)
                 cell_size_x = abs(transform[0])
-                cell_size_y = abs(transform[4])
+                cell_size_y = abs(transform[4])  # Use absolute value since y-axis is typically flipped
+                
+                # Validate cell size from transform
+                if cell_size_x <= 0 or cell_size_y <= 0:
+                    # Fallback: calculate from bounds and dimensions
+                    if bounds[2] > bounds[0] and bounds[3] > bounds[1] and dataset.width > 0 and dataset.height > 0:
+                        cell_size_x = (bounds[2] - bounds[0]) / dataset.width
+                        cell_size_y = abs((bounds[3] - bounds[1]) / dataset.height)
+                        print(f"[DEBUG] Tile {i+1} using fallback cell size calculation")
+                
+                # Calculate cell size from actual dimensions and bounds for validation
+                if bounds[2] > bounds[0] and bounds[3] > bounds[1] and dataset.width > 0 and dataset.height > 0:
+                    calc_cell_x = (bounds[2] - bounds[0]) / dataset.width
+                    calc_cell_y = (bounds[3] - bounds[1]) / dataset.height
+                    print(f"[DEBUG] Tile {i+1} calculated cell size from bounds: {calc_cell_x:.9f} x {calc_cell_y:.9f}")
+                
                 cell_sizes.append((cell_size_x, cell_size_y))
-                bounds_list.append(dataset.bounds)
-                print(f"[DEBUG] Tile {i+1}: {cell_size_x:.6f}m x {cell_size_y:.6f}m")
+                bounds_list.append(bounds)
+                print(f"[DEBUG] Tile {i+1}: transform cell size {cell_size_x:.9f} x {cell_size_y:.9f}")
             
-            # Find the finest resolution
+            # Find the finest resolution (smallest cell size)
             min_cell_x = min(cell_size[0] for cell_size in cell_sizes)
             min_cell_y = min(cell_size[1] for cell_size in cell_sizes)
-            print(f"[DEBUG] Finest resolution: {min_cell_x:.2f}m x {min_cell_y:.2f}m")
+            print(f"[DEBUG] Finest resolution: {min_cell_x:.9f} x {min_cell_y:.9f}")
             
             # Calculate overall bounds
             min_x = min(bounds[0] for bounds in bounds_list)
@@ -309,11 +545,30 @@ class MosaicWorker(QThread):
             max_x = max(bounds[2] for bounds in bounds_list)
             max_y = max(bounds[3] for bounds in bounds_list)
             
+            print(f"[DEBUG] Overall bounds: min_x={min_x:.6f}, max_x={max_x:.6f}, min_y={min_y:.6f}, max_y={max_y:.6f}")
+            print(f"[DEBUG] Bounds span: x={max_x - min_x:.6f}, y={max_y - min_y:.6f}")
+            
+            # Validate bounds
+            if max_x <= min_x or max_y <= min_y:
+                raise Exception(f"Invalid bounds: max_x ({max_x}) <= min_x ({min_x}) or max_y ({max_y}) <= min_y ({min_y})")
+            
+            # Validate cell sizes
+            if min_cell_x <= 0 or min_cell_y <= 0:
+                raise Exception(f"Invalid cell size: min_cell_x={min_cell_x}, min_cell_y={min_cell_y}")
+            
             # Calculate dimensions for the finest resolution
+            # Note: cell_size and bounds are in the same units (degrees for geographic CRS)
             width = int((max_x - min_x) / min_cell_x)
             height = int((max_y - min_y) / min_cell_y)
             
-            print(f"[DEBUG] Output dimensions: {width} x {height} pixels")
+            print(f"[DEBUG] Calculated output dimensions: {width} x {height} pixels")
+            
+            # Validate dimensions
+            if width <= 0 or height <= 0:
+                raise Exception(f"Invalid dimensions calculated: width={width}, height={height}. "
+                              f"This may indicate a units mismatch between bounds and cell size.")
+            
+            print(f"[DEBUG] Validated output dimensions: {width} x {height} pixels")
             
             # Create the output transform
             output_transform = rasterio.transform.from_bounds(min_x, min_y, max_x, max_y, width, height)
@@ -409,10 +664,10 @@ class MosaicWorker(QThread):
                 valid_mask = (src_data != -99999) & (src_data != np.nan) & (src_data != np.inf)
                 
                 if np.any(valid_mask):
-                    # Only update where source data is valid and deeper (more negative)
+                    # Only update where source data is valid and shallower (more positive/less negative)
                     update_mask = valid_mask & (
                         (output_window == -99999) | 
-                        (src_data < output_window)
+                        (src_data > output_window)
                     )
                     output_window[update_mask] = src_data[update_mask]
                     output_array[row_start:row_end, col_start:col_end] = output_window
@@ -477,11 +732,23 @@ class MosaicWorker(QThread):
             print(f"[DEBUG] Traceback: {traceback.format_exc()}")
             raise
         finally:
-            # Close all datasets
+            # Close all datasets and clean up temporary files
             for dataset in datasets:
                 try:
+                    # Clean up temporary files if they exist (from NetCDF conversion)
+                    temp_file = None
+                    if hasattr(dataset, '_temp_file'):
+                        temp_file = dataset._temp_file
                     dataset.close()
-                except:
+                    # Delete temporary file after closing
+                    if temp_file and os.path.exists(temp_file):
+                        try:
+                            os.remove(temp_file)
+                            print(f"[DEBUG] Cleaned up temporary file: {temp_file}")
+                        except Exception as e:
+                            print(f"[DEBUG] Could not delete temporary file {temp_file}: {e}")
+                except Exception as e:
+                    print(f"[DEBUG] Error closing dataset: {e}")
                     pass
 
     def validate_bathymetry_data(self, data):
@@ -714,17 +981,36 @@ class GMRTGrabber(QWidget):
         print("[DEBUG] Returning default home directory")
         return os.path.expanduser("~")
 
+    def get_layer_type(self):
+        """
+        Get the layer type value for API calls, mapping display text to API values.
+        
+        Returns:
+            str: The layer type value to send to the API
+        """
+        display_text = self.layer_combo.currentText()
+        # Map display text to API values
+        layer_mapping = {
+            "Topo-Bathy": "topo",
+            "Topo-Bathy (Observed Only)": "topo-mask"
+        }
+        return layer_mapping.get(display_text, display_text)
+
     def save_last_download_dir(self, directory):
         """
         Save the current download directory to the configuration file.
         
         This method saves the directory path so it can be restored
-        the next time the application is launched. If saving fails,
-        the error is silently ignored to prevent application crashes.
+        the next time the application is launched. It also updates
+        the instance variable so the directory is remembered within
+        the same session. If saving fails, the error is silently
+        ignored to prevent application crashes.
         
         Args:
             directory (str): Path to the directory to save
         """
+        # Update the instance variable so it's remembered within the same session
+        self.last_download_dir = directory
         try:
             config = {'last_download_dir': directory}
             with open(self.config_file, 'w') as f:
@@ -825,33 +1111,19 @@ class GMRTGrabber(QWidget):
         ])
         grid_form.addRow("Format", self.format_combo)
 
-        # Resolution selection
-        # GMRT provides different resolution levels for bathymetry data
-        self.resolution_combo = QComboBox()
-        self.resolution_combo.addItems([
-            "high",  # High resolution (detailed)
-            "low",   # Low resolution (coarse)
-            "med",   # Medium resolution (balanced)
-            "max"    # Maximum resolution (highest detail)
-        ])
-        self.resolution_combo.setEnabled(False)  # Disabled by default since mres_spin starts at 100
-        grid_form.addRow("Data Resolution (disable cell resolution to use)", self.resolution_combo)
-
-        # Custom meter resolution (optional)
-        # Allows users to specify exact meter-per-pixel resolution
-        self.mres_spin = QDoubleSpinBox()
-        self.mres_spin.setRange(0, 100000)  # 0 to 100km per pixel
-        self.mres_spin.setDecimals(2)       # 2 decimal places
-        self.mres_spin.setValue(500)        # Default to 500 meters/pixel
-        self.mres_spin.valueChanged.connect(self.toggle_resolution)  # Disable resolution combo when set
-        grid_form.addRow("Cell Resolution (meters/pixel, 0 to disable)", self.mres_spin)
+        # Cell resolution selection
+        # Allows users to specify meter-per-pixel resolution
+        self.mres_combo = QComboBox()
+        self.mres_combo.addItems(["100", "200", "400", "800"])
+        self.mres_combo.setCurrentText("400")  # Default to 400 meters/pixel
+        grid_form.addRow("Cell Resolution (meters/pixel)", self.mres_combo)
 
         # Data layer selection
         # Different layers provide different types of bathymetry data
         self.layer_combo = QComboBox()
         self.layer_combo.addItems([
-            "topo",      # Topography - Standard bathymetry data
-            "topo-mask"  # Topography with mask - High-resolution data only
+            "Topo-Bathy",                    # Topography - Standard bathymetry data
+            "Topo-Bathy (Observed Only)"     # Topography with mask - High-resolution data only
         ])
         grid_form.addRow("Layer", self.layer_combo)
 
@@ -875,20 +1147,10 @@ class GMRTGrabber(QWidget):
         # For large areas, breaking into tiles can prevent timeouts and improve reliability
         self.tile_checkbox = QCheckBox("Tile Dataset for Download")
         self.tile_checkbox.setToolTip(
-            "Break large datasets into tiles with configurable size and overlap (see parameters below)"
+            "Break large datasets into tiles with configurable size and automatic overlap based on cell resolution"
         )
         tiling_form.addRow(self.tile_checkbox)
         
-        # Overlap parameter for tiles
-        self.overlap_spin = QDoubleSpinBox()
-        self.overlap_spin.setRange(0.0, 1.0)  # 0 to 1 degree overlap
-        self.overlap_spin.setSingleStep(0.01)  # 0.01 degree increments
-        self.overlap_spin.setDecimals(3)  # 3 decimal places
-        self.overlap_spin.setValue(0.0)  # Default to 0 degrees
-        self.overlap_spin.setToolTip(
-            "Overlap between adjacent tiles in degrees (0.0 = no overlap, 0.01 = 0.01 degree overlap)"
-        )
-        tiling_form.addRow("Overlap (deg)", self.overlap_spin)
 
         # Mosaic tiles option
         # When enabled, automatically assemble all tiles into a single GeoTIFF
@@ -1235,12 +1497,6 @@ class GMRTGrabber(QWidget):
         self.log_area.clear()
         self.log_message("Log cleared")
 
-    def toggle_resolution(self):
-        # If mresolution is set (>0), disable resolution combo
-        if self.mres_spin.value() > 0:
-            self.resolution_combo.setEnabled(False)
-        else:
-            self.resolution_combo.setEnabled(True)
 
     def on_tile_checkbox_toggled(self, checked):
         """Enable/disable mosaic checkbox based on tile dataset checkbox"""
@@ -1312,15 +1568,15 @@ class GMRTGrabber(QWidget):
         lon_span = abs(east - west)
         lat_span = abs(north - south)
         
-        resolution = self.resolution_combo.currentText()
-        is_high_res = resolution in ["high", "max"]
+        mres_value = float(self.mres_combo.currentText())
+        is_high_res = mres_value <= 200  # Consider 100 or 200 as high resolution
         
         if is_high_res and (lon_span > 3 or lat_span > 3) and not self.tile_checkbox.isChecked():
             reply = QMessageBox.question(
                 self, 
                 "Large Grid Warning",
                 f"Your grid spans {lon_span:.1f}° longitude and {lat_span:.1f}° latitude.\n"
-                f"Downloading at {resolution} resolution may result in very large files.\n\n"
+                f"Downloading at {mres_value} meters/pixel resolution may result in very large files.\n\n"
                 f"Consider enabling 'Tile Dataset for Download' to break this into smaller tiles.\n\n"
                 f"Continue with single download?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -1334,9 +1590,49 @@ class GMRTGrabber(QWidget):
         else:
             return True
 
-    def generate_tiles(self, west, east, south, north, overlap=0.01):
-        """Generate tile boundaries for a large grid"""
+    def calculate_overlap_from_resolution(self):
+        """
+        Calculate overlap in degrees based on cell resolution.
+        Overlap is 2 grid cells worth of degrees.
+        
+        Returns:
+            float: Overlap in degrees (2 cells worth)
+        """
+        mres_value = float(self.mres_combo.currentText())
+        
+        # Use exact overlap values as specified (2 cells worth in degrees)
+        overlap_map = {
+            800: 0.016,  # 800m grids: 0.016 degrees
+            400: 0.008,  # 400m grids: 0.008 degrees
+            200: 0.004,  # 200m grids: 0.004 degrees
+            100: 0.002   # 100m grids: 0.002 degrees
+        }
+        
+        # Get overlap from map, or calculate if not in map
+        if mres_value in overlap_map:
+            overlap_degrees = overlap_map[mres_value]
+        else:
+            # Fallback: calculate from meters (approximate)
+            meters_per_degree = 111000.0
+            cell_size_degrees = mres_value / meters_per_degree
+            overlap_degrees = 2.0 * cell_size_degrees
+        
+        return overlap_degrees
+    
+    def generate_tiles(self, west, east, south, north, overlap=None):
+        """
+        Generate tile boundaries for a large grid.
+        
+        Args:
+            west, east, south, north: Overall bounds for the grid
+            overlap: Overlap in degrees (if None, calculated automatically from resolution)
+        """
         tiles = []
+        
+        # Calculate overlap automatically from cell resolution if not provided
+        if overlap is None:
+            overlap = self.calculate_overlap_from_resolution()
+            self.log_message(f"Auto-calculated overlap: {overlap:.6f} degrees (2 cells at {self.mres_combo.currentText()}m resolution)")
         
         # Calculate tile size from UI if available, else default to 3.0 degrees
         try:
@@ -1344,7 +1640,7 @@ class GMRTGrabber(QWidget):
         except Exception:
             tile_size = 3.0
         
-        # Generate longitude tiles
+        # Generate longitude tiles (without overlap applied yet)
         lon_tiles = []
         current_lon = west
         iteration = 0
@@ -1356,14 +1652,14 @@ class GMRTGrabber(QWidget):
             # Only add tile if it has meaningful size (at least 0.1 degrees)
             if tile_east - tile_west >= 0.1:
                 lon_tiles.append((tile_west, tile_east))
-                # Move to next tile position
+                # Move to next tile position (account for overlap)
                 current_lon = tile_east - overlap
             else:
                 break  # Exit the loop for tiny tiles
             
             iteration += 1
         
-        # Generate latitude tiles
+        # Generate latitude tiles (without overlap applied yet)
         lat_tiles = []
         current_lat = south
         iteration = 0
@@ -1375,28 +1671,39 @@ class GMRTGrabber(QWidget):
             # Only add tile if it has meaningful size (at least 0.1 degrees)
             if tile_north - tile_south >= 0.1:
                 lat_tiles.append((tile_south, tile_north))
-                # Move to next tile position
+                # Move to next tile position (account for overlap)
                 current_lat = tile_north - overlap
             else:
                 break  # Exit the loop for tiny tiles
             
             iteration += 1
         
-        # Generate all tile combinations with padding on all sides
-        padding = overlap  # Use the overlap value as padding (degrees)
+        # Generate all tile combinations with automatic overlap on all sides
+        # Overlap is applied per-tile, respecting geographic boundaries
         for i, (tile_west, tile_east) in enumerate(lon_tiles):
             for j, (tile_south, tile_north) in enumerate(lat_tiles):
-                # Add padding to all sides of each tile
-                padded_west = tile_west - padding
-                padded_east = tile_east + padding
-                padded_south = tile_south - padding
-                padded_north = tile_north + padding
+                # Start with original tile bounds
+                padded_west = tile_west
+                padded_east = tile_east
+                padded_south = tile_south
+                padded_north = tile_north
                 
-                # Ensure padding doesn't go beyond the overall bounds and global geographic limits
-                padded_west = max(padded_west, west, -180.0)  # Don't go west of -180°
-                padded_east = min(padded_east, east, 180.0)   # Don't go east of 180°
-                padded_south = max(padded_south, south, -90.0) # Don't go south of -90°
-                padded_north = min(padded_north, north, 90.0)  # Don't go north of 90°
+                # Add overlap to each edge, but respect geographic limits
+                # West edge: only add overlap if not at -180°
+                if padded_west > -180.0:
+                    padded_west = max(padded_west - overlap, -180.0)
+                
+                # East edge: only add overlap if not at 180°
+                if padded_east < 180.0:
+                    padded_east = min(padded_east + overlap, 180.0)
+                
+                # South edge: only add overlap if not at -90°
+                if padded_south > -90.0:
+                    padded_south = max(padded_south - overlap, -90.0)
+                
+                # North edge: only add overlap if not at 90°
+                if padded_north < 90.0:
+                    padded_north = min(padded_north + overlap, 90.0)
                 
                 tiles.append({
                     'west': padded_west,
@@ -1487,15 +1794,14 @@ class GMRTGrabber(QWidget):
         
         # Log the grid download request details
         format_type = self.format_combo.currentText()
-        layer_type = self.layer_combo.currentText()
-        resolution = self.resolution_combo.currentText()
+        layer_type_display = self.layer_combo.currentText()
+        layer_type = self.get_layer_type()
+        mres_value = self.mres_combo.currentText()
         
         self.log_message(f"Grid download request:")
         self.log_message(f"  Format: {format_type}")
-        self.log_message(f"  Layer: {layer_type}")
-        self.log_message(f"  Resolution: {resolution}")
-        if self.mres_spin.value() > 0:
-            self.log_message(f"  Custom resolution: {self.mres_spin.value()} meters/pixel")
+        self.log_message(f"  Layer: {layer_type_display}")
+        self.log_message(f"  Cell Resolution: {mres_value} meters/pixel")
         
         # Check for large grid warning
         try:
@@ -1512,7 +1818,7 @@ class GMRTGrabber(QWidget):
             return
 
         format_type = self.format_combo.currentText()
-        layer_type = self.layer_combo.currentText()
+        layer_type = self.get_layer_type()
         
         # Map format to file extension
         format_extensions = {
@@ -1525,14 +1831,14 @@ class GMRTGrabber(QWidget):
         file_ext = format_extensions.get(format_type, f".{format_type}")
         current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        self.log_message(f"Format: {format_type}, Layer: {layer_type}, Resolution: {self.resolution_combo.currentText()}")
+        layer_type_display = self.layer_combo.currentText()
+        self.log_message(f"Format: {format_type}, Layer: {layer_type_display}, Cell Resolution: {self.mres_combo.currentText()} meters/pixel")
         self.log_message("Parameters validated successfully")
 
         if self.tile_checkbox.isChecked():
             # Tiled download
-            overlap_value = self.overlap_spin.value()
-            self.log_message(f"Tiled download enabled (overlap: {overlap_value:.3f} degrees)")
-            tiles = self.generate_tiles(west, east, south, north, overlap=overlap_value)
+            # Overlap is now calculated automatically from cell resolution
+            tiles = self.generate_tiles(west, east, south, north)
             self.log_message(f"Generated {len(tiles)} tiles")
             
             if len(tiles) == 1:
@@ -1591,11 +1897,8 @@ class GMRTGrabber(QWidget):
                 "north": north,
                 "format": format_type,
                 "layer": layer_type,
+                "mresolution": float(self.mres_combo.currentText())
             }
-            if self.mres_spin.value() > 0:
-                params["mresolution"] = self.mres_spin.value()
-            else:
-                params["resolution"] = self.resolution_combo.currentText()
 
             self.status_label.setText("Downloading...")
             self.status_label.repaint()
@@ -1624,11 +1927,8 @@ class GMRTGrabber(QWidget):
             "north": tile['north'],
             "format": self.format_type,
             "layer": self.layer_type,
+            "mresolution": float(self.mres_combo.currentText())
         }
-        if self.mres_spin.value() > 0:
-            params["mresolution"] = self.mres_spin.value()
-        else:
-            params["resolution"] = self.resolution_combo.currentText()
         
         self.status_label.setText(f"Downloading tile {self.current_tile_index + 1}/{len(self.tiles_to_download)}: {tile_filename}")
         self.status_label.repaint()
@@ -1837,13 +2137,13 @@ class GMRTGrabber(QWidget):
                 self.downloaded_tile_files,
                 self.download_dir,
                 self.layer_type,
-                self.overlap_spin,
                 self.west_spin,
                 self.south_spin,
                 self.east_spin,
                 self.north_spin,
                 self.delete_tiles_checkbox,
-                self.split_checkbox
+                self.split_checkbox,
+                self.format_type
             )
             print("[DEBUG] Connecting signals...")
             self.mosaic_worker.progress.connect(self.on_mosaic_progress)
@@ -2146,11 +2446,23 @@ class GMRTGrabber(QWidget):
             
             self.log_message(f"Mosaicked file created: {os.path.basename(mosaic_path)}")
             
-            # Close all datasets
+            # Close all datasets and clean up temporary files
             for dataset in datasets:
                 try:
+                    # Clean up temporary files if they exist (from NetCDF conversion)
+                    temp_file = None
+                    if hasattr(dataset, '_temp_file'):
+                        temp_file = dataset._temp_file
                     dataset.close()
-                except:
+                    # Delete temporary file after closing
+                    if temp_file and os.path.exists(temp_file):
+                        try:
+                            os.remove(temp_file)
+                            print(f"[DEBUG] Cleaned up temporary file: {temp_file}")
+                        except Exception as e:
+                            print(f"[DEBUG] Could not delete temporary file {temp_file}: {e}")
+                except Exception as e:
+                    print(f"[DEBUG] Error closing dataset: {e}")
                     pass  # Ignore errors when closing
             
             # Delete individual tile files if enabled
@@ -2219,11 +2531,8 @@ class GMRTGrabber(QWidget):
             "north": tile['north'],
             "format": format_type,
             "layer": layer_type,
+            "mresolution": float(self.mres_combo.currentText())
         }
-        if self.mres_spin.value() > 0:
-            params["mresolution"] = self.mres_spin.value()
-        else:
-            params["resolution"] = self.resolution_combo.currentText()
 
         self.status_label.setText("Downloading...")
         self.status_label.repaint()
