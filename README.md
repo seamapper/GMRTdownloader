@@ -13,11 +13,13 @@ The GMRT Bathymetry Grid Downloader provides an intuitive graphical interface fo
 ## Features
 
 - 🗺️ **Interactive Map Preview** - Visual preview of selected areas using GMRT ImageServer
-- 📥 **Multiple Output Formats** - GeoTIFF, NetCDF, COARDS, and ESRI ASCII
-- 🎯 **Flexible Resolution Options** - High, low, medium, max resolution or custom meter resolution
-- 🧩 **Automatic Tiling** - Handles large datasets by automatically breaking them into manageable tiles
+- 📥 **Multiple Output Formats** - GeoTIFF, NetCDF, COARDS, and ESRI ASCII (with NetCDF mosaicing support)
+- 🎯 **Cell Resolution Selection** - Dropdown menu with preset resolutions: 100m, 200m, 400m, 800m (default: 400m)
+- 🧩 **Automatic Tiling** - Handles large datasets by automatically breaking them into manageable tiles with automatic overlap based on resolution
+- 🔀 **Intelligent Mosaicing** - Automatically combines tiles with preference for shallower values in overlapping areas
 - 📊 **Real-time Activity Logging** - Detailed log of all operations with timestamps
 - ✅ **Coordinate Validation** - Automatic validation of geographic coordinates
+- 💾 **Session Memory** - Remembers last download directory within the same session
 - 🎨 **User-Friendly GUI** - Clean, intuitive interface built with PyQt6
 
 ## Screenshots
@@ -75,8 +77,10 @@ Download the latest release for your platform:
    - South (minlatitude): -90° to 90°
    - North (maxlatitude): -90° to 90°
 3. **Choose output format:** GeoTIFF, NetCDF, COARDS, or ESRI ASCII
-4. **Select resolution:** High, low, medium, max, or enter custom meter resolution
-5. **Choose layer:** Topo or topo-mask
+4. **Select cell resolution:** Choose from dropdown (100m, 200m, 400m, or 800m per pixel) - default is 400m
+5. **Choose layer:** 
+   - **Topo-Bathy**: Standard bathymetry and topography data
+   - **Topo-Bathy (Observed Only)**: Only direct measurements, no interpolated data
 6. **Click "Refresh Map"** to preview the selected area
 7. **Click "Download Grid"** to start the download
 
@@ -89,15 +93,20 @@ Download the latest release for your platform:
 ### Download Options
 
 - **Single File**: Download the entire area as one file
-- **Tiled Dataset**: Automatically breaks large areas (>3°) into 3°×3° tiles with overlap
+- **Tiled Dataset**: Automatically breaks large areas into configurable-size tiles
+- **Automatic Overlap**: Overlap is automatically calculated as 2 grid cells based on selected resolution (0.002° to 0.016°)
+- **Smart Mosaicing**: Automatically combines tiles, preferring shallower values in overlapping areas for safer navigation data
+- **NetCDF Support**: Full support for downloading and mosaicing NetCDF format tiles
 - **Progress Tracking**: Real-time status updates and completion notifications
 
 ### Output Formats
 
 - **GeoTIFF (.tif)**: Raster format with embedded georeference information (recommended for GIS)
-- **NetCDF (.nc)**: Scientific data format with comprehensive metadata
+- **NetCDF (.nc)**: Scientific data format with comprehensive metadata (full mosaicing support)
 - **COARDS (.grd)**: ASCII grid format
 - **ESRI ASCII (.asc)**: Simple ASCII grid format
+
+All formats support automatic tiling and mosaicing when enabled.
 
 ## Building from Source
 
@@ -209,7 +218,8 @@ GMRTdownloader/
 ├── build.bat                    # Windows build script
 │
 ├── media/
-│   └── mgds.ico                 # Application icon
+│   ├── GMRT-logo2020.ico        # Application icon
+│   └── GMRT-logo2020.png        # Icon source file
 │
 ├── README.md                    # This file
 ├── GMRT_DOWNLOADER_README.md    # Detailed usage documentation
@@ -229,7 +239,16 @@ Contributions are welcome! Please feel free to submit a Pull Request. For major 
 
 ## Version History
 
-- **v2025.05** - UI cleanup and improvements
+- **v2025.05** - Major UI and functionality improvements
+  - Changed Cell Resolution to dropdown menu (100m, 200m, 400m, 800m)
+  - Removed Data Resolution option (always use Cell Resolution)
+  - Relabeled layer types for clarity (Topo-Bathy, Topo-Bathy Observed Only)
+  - Mosaicing now prefers shallower values in overlapping areas
+  - Fixed directory selection to remember last directory within session
+  - Added comprehensive NetCDF file support for mosaicing
+  - Implemented automatic tile overlap calculation (2 grid cells based on resolution)
+  - Removed manual overlap control (now automatic)
+  - Updated application icon to GMRT-logo2020.ico
 - **v2025.04** - Fixed tile size parameter functionality
 - **v2025.03** - Fixed tiling section to avoid gaps
 - **v2025.02** - Fixed zoom issues
