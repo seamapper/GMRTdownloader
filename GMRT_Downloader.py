@@ -8,7 +8,7 @@ Credit: Ryan, W.B.F., S.M. Carbotte, J.O. Coplan, S. O'Hara, A. Melkonian, R. Ar
 
 Features:
 - Interactive map preview using GMRT ImageServer
-- Multiple output formats (GeoTIFF, NetCDF, COARDS, ESRI ASCII)
+- Downloads in GeoTIFF format
 - Resolution options (high, low, med, max) and custom meter resolution
 - Tiled downloads for large datasets
 - Real-time activity logging
@@ -22,6 +22,7 @@ import sys
 import os
 import time
 import json
+import tempfile
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QComboBox, QPushButton, 
@@ -195,12 +196,45 @@ class MosaicWorker(QThread):
                             print(f"[DEBUG] Trying GDAL path: {gdal_path}")
                             dataset = rasterio.open(gdal_path)
                             print(f"[DEBUG] Successfully opened with pattern: {gdal_path}")
-                            return dataset
+                            
+                            # Check if the dataset has valid geographic metadata
+                            # If CRS is None or bounds are not geographic, we need to convert it
+                            try:
+                                src_bounds = dataset.bounds
+                                src_crs = dataset.crs
+                                needs_conversion = False
+                                
+                                if src_crs is None:
+                                    print(f"[DEBUG] Rasterio source has no CRS, will use netCDF4 fallback")
+                                    needs_conversion = True
+                                elif not src_crs.is_geographic:
+                                    print(f"[DEBUG] Rasterio source CRS is projected ({src_crs}), will use netCDF4 fallback")
+                                    needs_conversion = True
+                                elif src_crs.to_epsg() != 4326:
+                                    print(f"[DEBUG] Rasterio source CRS is not EPSG:4326 ({src_crs}), will use netCDF4 fallback")
+                                    needs_conversion = True
+                                elif (src_bounds[0] < -200 or src_bounds[2] > 200 or
+                                      src_bounds[1] < -100 or src_bounds[3] > 100):
+                                    print(f"[DEBUG] Rasterio source has bad bounds: {src_bounds}, will use netCDF4 fallback")
+                                    needs_conversion = True
+                                
+                                if needs_conversion:
+                                    print(f"[DEBUG] Closing rasterio source and falling back to netCDF4 approach")
+                                    dataset.close()
+                                    # Fall through to netCDF4 conversion
+                                    break
+                                else:
+                                    # Dataset is good, return it
+                                    return dataset
+                            except Exception as check_error:
+                                print(f"[DEBUG] Error checking dataset metadata: {check_error}, will use netCDF4 fallback")
+                                dataset.close()
+                                break
                         except Exception as e3:
                             print(f"[DEBUG] Failed with pattern {gdal_path}: {e3}")
                             continue
                     
-                    # If all GDAL patterns fail, try using netCDF4 to read and create a temporary GeoTIFF
+                    # If all GDAL patterns fail or produce invalid metadata, try using netCDF4 to read and create a temporary GeoTIFF
                     if netCDF4 is not None:
                         try:
                             print(f"[DEBUG] Attempting NetCDF4-based conversion for {os.path.basename(tile_file)}")
@@ -229,112 +263,189 @@ class MosaicWorker(QThread):
         # Open NetCDF file
         nc = netCDF4.Dataset(tile_file, 'r')
         
-        # Find the data variable (usually 2D or 3D)
-        data_var = None
-        for var_name in nc.variables:
-            var = nc.variables[var_name]
-            if len(var.dimensions) >= 2:
-                data_var = var_name
-                break
-        
-        if data_var is None:
-            nc.close()
-            raise Exception("No 2D data variable found in NetCDF file")
-        
-        # Read the data (handle 3D arrays by taking first slice if needed)
-        data = nc.variables[data_var][:]
-        if len(data.shape) == 3:
-            data = data[0, :, :]  # Take first band if 3D
-        
-        # Get coordinate variables
-        dims = nc.variables[data_var].dimensions
-        lat_var = None
-        lon_var = None
-        
-        for dim in dims:
-            if dim in nc.variables:
-                var = nc.variables[dim]
-                if hasattr(var, 'standard_name'):
-                    if 'lat' in var.standard_name.lower():
-                        lat_var = dim
-                    elif 'lon' in var.standard_name.lower():
-                        lon_var = dim
-        
-        # Fallback: try common names
-        if lat_var is None:
-            for name in ['lat', 'latitude', 'y']:
-                if name in nc.variables:
-                    lat_var = name
-                    break
-        if lon_var is None:
-            for name in ['lon', 'longitude', 'x']:
-                if name in nc.variables:
-                    lon_var = name
-                    break
-        
-        if lat_var is None or lon_var is None:
-            nc.close()
-            raise Exception("Could not find latitude/longitude variables in NetCDF file")
-        
-        # Get coordinates
-        lats = nc.variables[lat_var][:]
-        lons = nc.variables[lon_var][:]
-        
-        # Calculate transform
-        lat_min, lat_max = float(lats.min()), float(lats.max())
-        lon_min, lon_max = float(lons.min()), float(lons.max())
-        
-        # Calculate pixel size
-        if len(lats) > 1:
-            lat_res = abs(float(lats[1] - lats[0]))
-        else:
-            lat_res = abs(float(lat_max - lat_min))
-        
-        if len(lons) > 1:
-            lon_res = abs(float(lons[1] - lons[0]))
-        else:
-            lon_res = abs(float(lon_max - lon_min))
-        
-        # Create transform
-        from rasterio.transform import from_bounds
-        transform = from_bounds(lon_min, lat_min, lon_max, lat_max, 
-                               data.shape[1], data.shape[0])
-        
-        # Get CRS if available
-        crs = None
-        if hasattr(nc, 'crs') or hasattr(nc, 'spatial_ref'):
+        # Check if this is GMRT's special 1D array format
+        # GMRT NetCDF files have: z (1D array), dimension (grid size), x_range, y_range, spacing
+        if 'z' in nc.variables and 'dimension' in nc.variables and 'x_range' in nc.variables and 'y_range' in nc.variables:
+            print(f"[DEBUG] Detected GMRT 1D array format in _open_netcdf_with_netcdf4")
             try:
-                import rasterio.crs
-                # Try to get CRS from global attributes
-                if hasattr(nc, 'crs_wkt'):
-                    crs = rasterio.crs.CRS.from_wkt(nc.crs_wkt)
-                elif hasattr(nc, 'epsg'):
-                    crs = rasterio.crs.CRS.from_epsg(int(nc.epsg))
-            except:
-                pass
-        
-        if crs is None:
-            crs = rasterio.crs.CRS.from_epsg(4326)  # Default to WGS84
+                # Get grid dimensions
+                dimension = nc.variables['dimension'][:]
+                if len(dimension) >= 2:
+                    ncols = int(dimension[0])
+                    nrows = int(dimension[1])
+                else:
+                    nc.close()
+                    raise Exception(f"Invalid dimension array: {dimension}")
+                
+                print(f"[DEBUG] Grid dimensions: {ncols} x {nrows}")
+                
+                # Get coordinate ranges
+                x_range = nc.variables['x_range'][:]
+                y_range = nc.variables['y_range'][:]
+                lon_min = float(x_range[0])
+                lon_max = float(x_range[1])
+                lat_min = float(y_range[0])
+                lat_max = float(y_range[1])
+                
+                print(f"[DEBUG] Coordinate ranges: lon={lon_min:.6f} to {lon_max:.6f}, lat={lat_min:.6f} to {lat_max:.6f}")
+                
+                # Get the 1D data array
+                z_data = nc.variables['z'][:]
+                print(f"[DEBUG] Z data shape: {z_data.shape}, expected size: {nrows * ncols}")
+                
+                # Reshape to 2D (row-major, C order)
+                if z_data.size == nrows * ncols:
+                    data = z_data.reshape((nrows, ncols), order='C')
+                    print(f"[DEBUG] Reshaped data to 2D: {data.shape}")
+                else:
+                    nc.close()
+                    raise Exception(f"Data size mismatch: got {z_data.size}, expected {nrows * ncols}")
+                
+                # Create transform
+                from rasterio.transform import from_bounds
+                from rasterio.crs import CRS
+                transform = from_bounds(lon_min, lat_min, lon_max, lat_max, ncols, nrows)
+                print(f"[DEBUG] Transform: {transform}")
+                
+                # Use EPSG:4326 for GMRT data
+                crs = CRS.from_epsg(4326)
+                
+                # Handle nodata
+                nodata_value = None
+                if 'z_range' in nc.variables:
+                    nodata_value = -99999  # Common nodata value
+                
+                nc.close()
+            except Exception as e:
+                nc.close()
+                raise Exception(f"Error processing GMRT 1D format: {e}")
+        else:
+            # Standard NetCDF format - find the data variable (usually 2D or 3D)
+            data_var = None
+            for var_name in nc.variables:
+                var = nc.variables[var_name]
+                if len(var.dimensions) >= 2:
+                    data_var = var_name
+                    break
+            
+            if data_var is None:
+                nc.close()
+                raise Exception("No 2D data variable found in NetCDF file")
+            
+            # Read the data (handle 3D arrays by taking first slice if needed)
+            data = nc.variables[data_var][:]
+            if len(data.shape) == 3:
+                data = data[0, :, :]  # Take first band if 3D
+            
+            # Get coordinate variables
+            dims = nc.variables[data_var].dimensions
+            lat_var = None
+            lon_var = None
+            
+            for dim in dims:
+                if dim in nc.variables:
+                    var = nc.variables[dim]
+                    if hasattr(var, 'standard_name'):
+                        if 'lat' in var.standard_name.lower():
+                            lat_var = dim
+                        elif 'lon' in var.standard_name.lower():
+                            lon_var = dim
+            
+            # Fallback: try common names
+            if lat_var is None:
+                for name in ['lat', 'latitude', 'y']:
+                    if name in nc.variables:
+                        lat_var = name
+                        break
+            if lon_var is None:
+                for name in ['lon', 'longitude', 'x']:
+                    if name in nc.variables:
+                        lon_var = name
+                        break
+            
+            if lat_var is None or lon_var is None:
+                nc.close()
+                raise Exception("Could not find latitude/longitude variables in NetCDF file")
+            
+            # Get coordinates
+            lats = nc.variables[lat_var][:]
+            lons = nc.variables[lon_var][:]
+            
+            # Calculate transform
+            lat_min, lat_max = float(lats.min()), float(lats.max())
+            lon_min, lon_max = float(lons.min()), float(lons.max())
+            
+            # Calculate pixel size
+            if len(lats) > 1:
+                lat_res = abs(float(lats[1] - lats[0]))
+            else:
+                lat_res = abs(float(lat_max - lat_min))
+            
+            if len(lons) > 1:
+                lon_res = abs(float(lons[1] - lons[0]))
+            else:
+                lon_res = abs(float(lon_max - lon_min))
+            
+            # Create transform
+            from rasterio.transform import from_bounds
+            transform = from_bounds(lon_min, lat_min, lon_max, lat_max, 
+                                   data.shape[1], data.shape[0])
+            
+            # Get CRS if available
+            crs = None
+            if hasattr(nc, 'crs') or hasattr(nc, 'spatial_ref'):
+                try:
+                    import rasterio.crs
+                    # Try to get CRS from global attributes
+                    if hasattr(nc, 'crs_wkt'):
+                        crs = rasterio.crs.CRS.from_wkt(nc.crs_wkt)
+                    elif hasattr(nc, 'epsg'):
+                        crs = rasterio.crs.CRS.from_epsg(int(nc.epsg))
+                except:
+                    pass
+            
+            if crs is None:
+                crs = rasterio.crs.CRS.from_epsg(4326)  # Default to WGS84
+            
+            # Handle nodata
+            nodata_value = None
+            if hasattr(nc.variables[data_var], '_FillValue'):
+                nodata_value = nc.variables[data_var]._FillValue
+            
+            nc.close()
         
         # Create a temporary GeoTIFF
         temp_tiff = tempfile.NamedTemporaryFile(suffix='.tif', delete=False)
         temp_tiff.close()
         
-        # Write data to temporary GeoTIFF
-        with rasterio.open(
-            temp_tiff.name, 'w',
-            driver='GTiff',
-            height=data.shape[0],
-            width=data.shape[1],
-            count=1,
-            dtype=data.dtype,
-            crs=crs,
-            transform=transform,
-            nodata=nc.variables[data_var]._FillValue if hasattr(nc.variables[data_var], '_FillValue') else None
-        ) as dst:
-            dst.write(data, 1)
+        # Only use tiled format if dimensions are compatible
+        use_tiled = (data.shape[0] % 16 == 0) and (data.shape[1] % 16 == 0)
         
-        nc.close()
+        # Write data to temporary GeoTIFF
+        profile = {
+            'driver': 'GTiff',
+            'height': data.shape[0],
+            'width': data.shape[1],
+            'count': 1,
+            'dtype': data.dtype,
+            'crs': crs,
+            'transform': transform,
+            'compress': 'lzw',
+            'tiled': use_tiled
+        }
+        
+        if nodata_value is not None:
+            profile['nodata'] = nodata_value
+        
+        # If tiled, set appropriate block sizes
+        if use_tiled:
+            profile['blockxsize'] = min(512, data.shape[1])
+            profile['blockysize'] = min(512, data.shape[0])
+            profile['blockxsize'] = (profile['blockxsize'] // 16) * 16
+            profile['blockysize'] = (profile['blockysize'] // 16) * 16
+        
+        with rasterio.open(temp_tiff.name, 'w', **profile) as dst:
+            dst.write(data, 1)
         
         # Open the temporary GeoTIFF with rasterio
         dataset = rasterio.open(temp_tiff.name)
@@ -506,10 +617,61 @@ class MosaicWorker(QThread):
             for i, dataset in enumerate(datasets):
                 transform = dataset.transform
                 bounds = dataset.bounds
+                crs = dataset.crs
                 print(f"[DEBUG] Tile {i+1} transform: {transform}")
                 print(f"[DEBUG] Tile {i+1} bounds: {bounds}")
-                print(f"[DEBUG] Tile {i+1} CRS: {dataset.crs}")
+                print(f"[DEBUG] Tile {i+1} CRS: {crs}")
+                print(f"[DEBUG] Tile {i+1} CRS is geographic: {crs.is_geographic if crs else 'None'}")
                 print(f"[DEBUG] Tile {i+1} size: {dataset.width} x {dataset.height}")
+                
+                # INVESTIGATE CELL REGISTRATION: Check if bounds represent pixel centers or edges
+                if i == 0:  # Only check first tile for registration type
+                    from rasterio.transform import xy
+                    # Get the first pixel center coordinates from the transform
+                    first_pixel_center_lon, first_pixel_center_lat = xy(transform, 0, 0)
+                    # Get the last pixel center coordinates
+                    last_pixel_center_lon, last_pixel_center_lat = xy(transform, dataset.height - 1, dataset.width - 1)
+                    
+                    # Calculate cell sizes
+                    cell_size_x = abs(transform[0])
+                    cell_size_y = abs(transform[4])
+                    
+                    print(f"[DEBUG] === CELL REGISTRATION INVESTIGATION ===")
+                    print(f"[DEBUG] Tile bounds (from dataset.bounds): west={bounds[0]:.9f}, east={bounds[2]:.9f}, south={bounds[1]:.9f}, north={bounds[3]:.9f}")
+                    print(f"[DEBUG] First pixel center (from transform): lon={first_pixel_center_lon:.9f}, lat={first_pixel_center_lat:.9f}")
+                    print(f"[DEBUG] Last pixel center (from transform): lon={last_pixel_center_lon:.9f}, lat={last_pixel_center_lat:.9f}")
+                    print(f"[DEBUG] Cell size: {cell_size_x:.9f} x {cell_size_y:.9f} degrees")
+                    
+                    # Check if bounds represent pixel edges or centers
+                    # If pixel-edge registration: first_pixel_center = bounds[0] + cell_size_x/2
+                    # If pixel-center registration: first_pixel_center = bounds[0]
+                    expected_edge_registration_lon = bounds[0] + cell_size_x / 2.0
+                    expected_edge_registration_lat = bounds[3] - cell_size_y / 2.0  # North is top, so subtract
+                    
+                    lon_diff_edge = abs(first_pixel_center_lon - expected_edge_registration_lon)
+                    lat_diff_edge = abs(first_pixel_center_lat - expected_edge_registration_lat)
+                    lon_diff_center = abs(first_pixel_center_lon - bounds[0])
+                    lat_diff_center = abs(first_pixel_center_lat - bounds[3])
+                    
+                    print(f"[DEBUG] If EDGE registration: first pixel center should be at lon={expected_edge_registration_lon:.9f}, lat={expected_edge_registration_lat:.9f}")
+                    print(f"[DEBUG] Difference from edge registration: lon={lon_diff_edge:.9f}, lat={lat_diff_edge:.9f}")
+                    print(f"[DEBUG] Difference from center registration: lon={lon_diff_center:.9f}, lat={lat_diff_center:.9f}")
+                    
+                    if lon_diff_edge < 1e-6 and lat_diff_edge < 1e-6:
+                        print(f"[DEBUG] >>> TILE USES PIXEL-EDGE REGISTRATION (bounds = pixel edges) <<<")
+                    elif lon_diff_center < 1e-6 and lat_diff_center < 1e-6:
+                        print(f"[DEBUG] >>> TILE USES PIXEL-CENTER REGISTRATION (bounds = pixel centers) <<<")
+                    else:
+                        print(f"[DEBUG] >>> WARNING: Registration type unclear! Differences don't match either pattern <<<")
+                    print(f"[DEBUG] ==========================================")
+                
+                # Validate bounds are reasonable for geographic CRS
+                if crs and crs.is_geographic:
+                    # Geographic bounds should be in degrees: lon -180 to 180, lat -90 to 90
+                    if bounds[0] < -200 or bounds[2] > 200 or bounds[1] < -100 or bounds[3] > 100:
+                        print(f"[DEBUG] WARNING: Tile {i+1} bounds look like they might be in wrong units!")
+                        print(f"[DEBUG] Expected degrees (lon: -180 to 180, lat: -90 to 90)")
+                        print(f"[DEBUG] Got: lon {bounds[0]:.2f} to {bounds[2]:.2f}, lat {bounds[1]:.2f} to {bounds[3]:.2f}")
                 
                 # Get cell size from transform (units depend on CRS - degrees for geographic, meters for projected)
                 # Note: transform[4] is typically negative for geographic CRS (y-axis points down in image space)
@@ -533,19 +695,31 @@ class MosaicWorker(QThread):
                 cell_sizes.append((cell_size_x, cell_size_y))
                 bounds_list.append(bounds)
                 print(f"[DEBUG] Tile {i+1}: transform cell size {cell_size_x:.9f} x {cell_size_y:.9f}")
+                print(f"[DEBUG] === TILE {i+1} CELL SIZE: {cell_size_x:.9f}° x {cell_size_y:.9f}° (lon x lat) ===")
             
             # Find the finest resolution (smallest cell size)
             min_cell_x = min(cell_size[0] for cell_size in cell_sizes)
             min_cell_y = min(cell_size[1] for cell_size in cell_sizes)
             print(f"[DEBUG] Finest resolution: {min_cell_x:.9f} x {min_cell_y:.9f}")
             
-            # Calculate overall bounds
-            min_x = min(bounds[0] for bounds in bounds_list)
-            min_y = min(bounds[1] for bounds in bounds_list)
-            max_x = max(bounds[2] for bounds in bounds_list)
-            max_y = max(bounds[3] for bounds in bounds_list)
+            # Calculate union of tile bounds
+            tile_min_x = min(bounds[0] for bounds in bounds_list)
+            tile_min_y = min(bounds[1] for bounds in bounds_list)
+            tile_max_x = max(bounds[2] for bounds in bounds_list)
+            tile_max_y = max(bounds[3] for bounds in bounds_list)
+            print(f"[DEBUG] Tile union bounds: min_x={tile_min_x:.6f}, max_x={tile_max_x:.6f}, min_y={tile_min_y:.6f}, max_y={tile_max_y:.6f}")
             
-            print(f"[DEBUG] Overall bounds: min_x={min_x:.6f}, max_x={max_x:.6f}, min_y={min_y:.6f}, max_y={max_y:.6f}")
+            # Get the first tile's transform to understand the grid alignment
+            # We need to align the output transform to the same grid as the tiles
+            first_tile_transform = datasets[0].transform
+            from rasterio.transform import xy
+            first_tile_first_pixel_lon, first_tile_first_pixel_lat = xy(first_tile_transform, 0, 0)
+            
+            print(f"[DEBUG] First tile's first pixel center: lon={first_tile_first_pixel_lon:.9f}, lat={first_tile_first_pixel_lat:.9f}")
+            
+            # Use original requested bounds for the output extent
+            min_x, min_y, max_x, max_y = original_bounds
+            print(f"[DEBUG] Using original requested bounds: min_x={min_x:.6f}, max_x={max_x:.6f}, min_y={min_y:.6f}, max_y={max_y:.6f}")
             print(f"[DEBUG] Bounds span: x={max_x - min_x:.6f}, y={max_y - min_y:.6f}")
             
             # Validate bounds
@@ -570,14 +744,68 @@ class MosaicWorker(QThread):
             
             print(f"[DEBUG] Validated output dimensions: {width} x {height} pixels")
             
-            # Create the output transform
-            output_transform = rasterio.transform.from_bounds(min_x, min_y, max_x, max_y, width, height)
+            # ALIGN OUTPUT TRANSFORM TO TILE GRID
+            # Instead of using from_bounds which creates a transform aligned to the bounds,
+            # we need to create a transform that aligns with the tile grid.
+            # Calculate how many pixels from the first tile's first pixel to the requested west edge
+            # The first tile's first pixel center is at first_tile_first_pixel_lon
+            # We want the output's first pixel to align with the tile grid
+            
+            # Calculate the offset from the first tile's first pixel to the requested west edge
+            # Then snap to the nearest pixel center on the tile grid
+            offset_from_first_pixel = min_x - first_tile_first_pixel_lon
+            pixels_offset = round(offset_from_first_pixel / min_cell_x)
+            aligned_west = first_tile_first_pixel_lon + pixels_offset * min_cell_x
+            
+            # Do the same for latitude (north edge)
+            offset_from_first_pixel_lat = max_y - first_tile_first_pixel_lat
+            pixels_offset_lat = round(offset_from_first_pixel_lat / min_cell_y)
+            aligned_north = first_tile_first_pixel_lat + pixels_offset_lat * min_cell_y
+            
+            # Calculate aligned east and south based on width/height
+            aligned_east = aligned_west + width * min_cell_x
+            aligned_south = aligned_north - height * min_cell_y
+            
+            print(f"[DEBUG] === OUTPUT TRANSFORM ALIGNMENT ===")
+            print(f"[DEBUG] Requested bounds: west={min_x:.9f}, east={max_x:.9f}, south={min_y:.9f}, north={max_y:.9f}")
+            print(f"[DEBUG] Aligned bounds: west={aligned_west:.9f}, east={aligned_east:.9f}, south={aligned_south:.9f}, north={aligned_north:.9f}")
+            print(f"[DEBUG] Alignment offset: lon={aligned_west - min_x:.9f}, lat={aligned_north - max_y:.9f}")
+            print(f"[DEBUG] ===================================")
+            
+            # Create the output transform using aligned bounds (aligned to tile grid)
+            output_transform = rasterio.transform.from_bounds(aligned_west, aligned_south, aligned_east, aligned_north, width, height)
+            
+            # INVESTIGATE OUTPUT TRANSFORM REGISTRATION
+            from rasterio.transform import xy
+            output_first_pixel_center_lon, output_first_pixel_center_lat = xy(output_transform, 0, 0)
+            output_last_pixel_center_lon, output_last_pixel_center_lat = xy(output_transform, height - 1, width - 1)
+            
+            print(f"[DEBUG] === OUTPUT TRANSFORM REGISTRATION INVESTIGATION ===")
+            print(f"[DEBUG] Output bounds (from from_bounds): west={min_x:.9f}, east={max_x:.9f}, south={min_y:.9f}, north={max_y:.9f}")
+            print(f"[DEBUG] Output first pixel center (from transform): lon={output_first_pixel_center_lon:.9f}, lat={output_first_pixel_center_lat:.9f}")
+            print(f"[DEBUG] Output last pixel center (from transform): lon={output_last_pixel_center_lon:.9f}, lat={output_last_pixel_center_lat:.9f}")
+            print(f"[DEBUG] Output cell size: {min_cell_x:.9f} x {min_cell_y:.9f} degrees")
+            
+            # from_bounds creates edge-registered transform
+            expected_output_edge_lon = min_x + min_cell_x / 2.0
+            expected_output_edge_lat = max_y - min_cell_y / 2.0
+            
+            output_lon_diff = abs(output_first_pixel_center_lon - expected_output_edge_lon)
+            output_lat_diff = abs(output_first_pixel_center_lat - expected_output_edge_lat)
+            
+            print(f"[DEBUG] Expected first pixel center (edge registration): lon={expected_output_edge_lon:.9f}, lat={expected_output_edge_lat:.9f}")
+            print(f"[DEBUG] Difference: lon={output_lon_diff:.9f}, lat={output_lat_diff:.9f}")
+            if output_lon_diff < 1e-6 and output_lat_diff < 1e-6:
+                print(f"[DEBUG] >>> OUTPUT USES PIXEL-EDGE REGISTRATION (as expected from from_bounds) <<<")
+            else:
+                print(f"[DEBUG] >>> WARNING: Output transform doesn't match expected edge registration! <<<")
+            print(f"[DEBUG] =====================================================")
             
             # Initialize the output array with nodata values
             output_array = np.full((height, width), -99999, dtype=np.float32)
             
-            # Process each dataset
-            print("[DEBUG] Processing tiles with proper resampling...")
+            # Process each dataset using rasterio.warp.reproject for proper alignment
+            print("[DEBUG] Processing tiles with rasterio.warp.reproject for proper alignment...")
             for i, dataset in enumerate(datasets):
                 print(f"[DEBUG] Processing tile {i+1}/{len(datasets)}...")
                 
@@ -592,85 +820,43 @@ class MosaicWorker(QThread):
                 
                 # Get the source transform and bounds
                 src_transform = dataset.transform
+                src_crs = dataset.crs
                 src_bounds = dataset.bounds
                 
                 print(f"[DEBUG] Tile {i+1} bounds: {src_bounds}")
                 print(f"[DEBUG] Tile {i+1} data shape: {data.shape}")
                 print(f"[DEBUG] Tile {i+1} transform: {src_transform}")
                 
-                # Calculate the window in the output array
-                col_start = int((src_bounds[0] - min_x) / min_cell_x)
-                col_end = int((src_bounds[2] - min_x) / min_cell_x)
-                row_start = int((max_y - src_bounds[3]) / min_cell_y)
-                row_end = int((max_y - src_bounds[1]) / min_cell_y)
+                # Use rasterio.warp.reproject to properly align and resample the tile
+                # This handles all coordinate transformations correctly
+                from rasterio.warp import reproject, Resampling
                 
-                print(f"[DEBUG] Tile {i+1} output window (before bounds check): row {row_start}-{row_end}, col {col_start}-{col_end}")
+                # Create a temporary array for this tile's contribution to the output
+                tile_output = np.full((height, width), -99999, dtype=np.float32)
                 
-                # Ensure indices are within bounds
-                col_start = max(0, col_start)
-                col_end = min(width, col_end)
-                row_start = max(0, row_start)
-                row_end = min(height, row_end)
-                
-                print(f"[DEBUG] Tile {i+1} output window (after bounds check): row {row_start}-{row_end}, col {col_start}-{col_end}")
-                
-                if col_end <= col_start or row_end <= row_start:
-                    print(f"[DEBUG] Warning: Tile {i+1} has no overlap with output area")
-                    continue
-                
-                # Calculate the corresponding window in the source data
-                # Use rasterio's transform to convert coordinates to pixel coordinates
-                from rasterio.transform import rowcol
-                
-                # Calculate the bounds of the output window in geographic coordinates
-                output_west = min_x + col_start * min_cell_x
-                output_east = min_x + col_end * min_cell_x
-                output_north = max_y - row_start * min_cell_y
-                output_south = max_y - row_end * min_cell_y
-                
-                print(f"[DEBUG] Tile {i+1} output bounds: W={output_west:.6f}, E={output_east:.6f}, S={output_south:.6f}, N={output_north:.6f}")
-                
-                # Convert these bounds to source pixel coordinates
-                src_row_start, src_col_start = rowcol(src_transform, output_west, output_north)
-                src_row_end, src_col_end = rowcol(src_transform, output_east, output_south)
-                
-                print(f"[DEBUG] Tile {i+1} source window (before bounds check): row {src_row_start}-{src_row_end}, col {src_col_start}-{src_col_end}")
-                
-                # Ensure indices are within bounds
-                src_row_start = max(0, src_row_start)
-                src_row_end = min(data.shape[0], src_row_end)
-                src_col_start = max(0, src_col_start)
-                src_col_end = min(data.shape[1], src_col_end)
-                
-                if src_col_end <= src_col_start or src_row_end <= src_row_start:
-                    print(f"[DEBUG] Warning: Tile {i+1} source window is invalid (src: {src_row_start}-{src_row_end}, {src_col_start}-{src_col_end})")
-                    continue
-                
-                # Extract the source data window
-                src_data = data[src_row_start:src_row_end, src_col_start:src_col_end]
-                
-                # Resample if necessary
-                if src_data.shape != (row_end - row_start, col_end - col_start):
-                    # Use scipy for resampling
-                    from scipy.ndimage import zoom
-                    zoom_factors = (
-                        (row_end - row_start) / src_data.shape[0],
-                        (col_end - col_start) / src_data.shape[1]
-                    )
-                    src_data = zoom(src_data, zoom_factors, order=1, mode='nearest')
+                # Reproject the tile data to the output grid
+                reproject(
+                    source=data,
+                    destination=tile_output,
+                    src_transform=src_transform,
+                    src_crs=src_crs,
+                    dst_transform=output_transform,
+                    dst_crs=datasets[0].crs,  # Use CRS from first dataset
+                    resampling=Resampling.nearest,
+                    src_nodata=-99999,
+                    dst_nodata=-99999
+                )
                 
                 # Merge data using maximum (shallowest) values
-                output_window = output_array[row_start:row_end, col_start:col_end]
-                valid_mask = (src_data != -99999) & (src_data != np.nan) & (src_data != np.inf)
+                valid_mask = (tile_output != -99999) & ~np.isnan(tile_output) & ~np.isinf(tile_output)
                 
                 if np.any(valid_mask):
                     # Only update where source data is valid and shallower (more positive/less negative)
                     update_mask = valid_mask & (
-                        (output_window == -99999) | 
-                        (src_data > output_window)
+                        (output_array == -99999) | 
+                        (tile_output > output_array)
                     )
-                    output_window[update_mask] = src_data[update_mask]
-                    output_array[row_start:row_end, col_start:col_end] = output_window
+                    output_array[update_mask] = tile_output[update_mask]
                     
                     valid_count = np.sum(valid_mask)
                     print(f"[DEBUG] Tile {i+1}: Updated {valid_count} valid pixels")
@@ -681,20 +867,8 @@ class MosaicWorker(QThread):
             print("[DEBUG] Performing final data validation...")
             output_array = self.validate_bathymetry_data(output_array)
             
-            # Crop to exact requested bounds if different from overall bounds
-            if original_bounds != (min_x, min_y, max_x, max_y):
-                print("[DEBUG] Cropping to exact requested bounds...")
-                try:
-                    window = from_bounds(*original_bounds, output_transform)
-                    row_start = max(0, int(window.row_off))
-                    row_end = min(height, int(window.row_off + window.height))
-                    col_start = max(0, int(window.col_off))
-                    col_end = min(width, int(window.col_off + window.width))
-                    
-                    output_array = output_array[row_start:row_end, col_start:col_end]
-                    output_transform = from_bounds(*original_bounds, col_end - col_start, row_end - row_start)
-                except Exception as e:
-                    print(f"[DEBUG] Warning: Could not crop to exact bounds: {e}")
+            # No need to crop since we already used original_bounds for the output transform
+            # The output array is already aligned to the requested bounds
             
             # Create output profile
             profile = {
@@ -798,28 +972,884 @@ class MosaicWorker(QThread):
         return validated_data
 
 
+def convert_netcdf_to_geotiff(netcdf_path, output_path):
+    """
+    Convert NetCDF file to GeoTIFF format.
+    
+    Args:
+        netcdf_path (str): Path to input NetCDF file
+        output_path (str): Path to output GeoTIFF file
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if rasterio is None:
+        return False
+    
+    try:
+        # Try multiple approaches to open NetCDF with rasterio
+        src = None
+        
+        # Approach 1: Try opening directly
+        try:
+            src = rasterio.open(netcdf_path)
+            print(f"[DEBUG] Successfully opened NetCDF with direct rasterio.open")
+        except Exception as e1:
+            print(f"[DEBUG] Direct rasterio.open failed: {e1}")
+            pass
+        
+        # Approach 2: Try with NETCDF driver
+        if src is None:
+            try:
+                src = rasterio.open(netcdf_path, driver='NETCDF')
+                print(f"[DEBUG] Successfully opened NetCDF with NETCDF driver")
+            except Exception as e2:
+                print(f"[DEBUG] NETCDF driver failed: {e2}")
+                pass
+        
+        # Approach 3: Try with GDAL virtual dataset patterns
+        if src is None:
+            gdal_patterns = [
+                f'NETCDF:"{netcdf_path}":z',
+                f'NETCDF:"{netcdf_path}":elevation',
+                f'NETCDF:"{netcdf_path}":topo',
+                f'NETCDF:"{netcdf_path}":bathy',
+                f'NETCDF:"{netcdf_path}"',
+            ]
+            for pattern in gdal_patterns:
+                try:
+                    src = rasterio.open(pattern)
+                    print(f"[DEBUG] Successfully opened NetCDF with pattern: {pattern}")
+                    break
+                except Exception as e3:
+                    print(f"[DEBUG] Pattern {pattern} failed: {e3}")
+                    continue
+        
+        # Check if rasterio source has valid bounds/CRS before using it
+        if src is not None:
+            try:
+                src_bounds = src.bounds
+                src_crs = src.crs
+                # Check if we need to fallback due to bad bounds/CRS
+                needs_fallback = False
+                if src_crs is None:
+                    print(f"[DEBUG] Rasterio source has no CRS, will use netCDF4 fallback")
+                    needs_fallback = True
+                elif not src_crs.is_geographic:
+                    print(f"[DEBUG] Rasterio source CRS is projected ({src_crs}), will use netCDF4 fallback")
+                    needs_fallback = True
+                elif src_crs.to_epsg() != 4326:
+                    print(f"[DEBUG] Rasterio source CRS is not EPSG:4326 ({src_crs}), will use netCDF4 fallback")
+                    needs_fallback = True
+                elif (src_bounds[0] < -200 or src_bounds[2] > 200 or 
+                      src_bounds[1] < -100 or src_bounds[3] > 100):
+                    print(f"[DEBUG] Rasterio source has bad bounds: {src_bounds}, will use netCDF4 fallback")
+                    needs_fallback = True
+                
+                if needs_fallback:
+                    print(f"[DEBUG] Closing rasterio source and falling back to netCDF4 approach")
+                    src.close()
+                    src = None
+            except Exception as e:
+                print(f"[DEBUG] Error checking rasterio source bounds/CRS: {e}, will use netCDF4 fallback")
+                # If we can't check, close and fallback
+                if src:
+                    src.close()
+                src = None
+        
+        # Approach 4: Try with netCDF4 library and convert directly to GeoTIFF
+        if src is None and netCDF4 is not None:
+            try:
+                print(f"[DEBUG] Attempting netCDF4-based conversion")
+                # Open with netCDF4 and find the data variable
+                with netCDF4.Dataset(netcdf_path, 'r') as nc:
+                    # Debug: Print all variables
+                    print(f"[DEBUG] NetCDF variables: {list(nc.variables.keys())}")
+                    print(f"[DEBUG] NetCDF dimensions: {list(nc.dimensions.keys())}")
+                    
+                    # Check if this is GMRT's special 1D array format
+                    # GMRT NetCDF files have: z (1D array), dimension (grid size), x_range, y_range, spacing
+                    if 'z' in nc.variables and 'dimension' in nc.variables and 'x_range' in nc.variables and 'y_range' in nc.variables:
+                        print(f"[DEBUG] Detected GMRT 1D array format")
+                        try:
+                            # Get grid dimensions
+                            dimension = nc.variables['dimension'][:]
+                            if len(dimension) >= 2:
+                                ncols = int(dimension[0])
+                                nrows = int(dimension[1])
+                            else:
+                                print(f"[DEBUG] Invalid dimension array: {dimension}")
+                                return False
+                            
+                            print(f"[DEBUG] Grid dimensions: {ncols} x {nrows}")
+                            
+                            # Get coordinate ranges
+                            x_range = nc.variables['x_range'][:]
+                            y_range = nc.variables['y_range'][:]
+                            lon_min = float(x_range[0])
+                            lon_max = float(x_range[1])
+                            lat_min = float(y_range[0])
+                            lat_max = float(y_range[1])
+                            
+                            print(f"[DEBUG] Coordinate ranges: lon={lon_min:.6f} to {lon_max:.6f}, lat={lat_min:.6f} to {lat_max:.6f}")
+                            
+                            # Get the 1D data array
+                            z_data = nc.variables['z'][:]
+                            print(f"[DEBUG] Z data shape: {z_data.shape}, expected size: {nrows * ncols}")
+                            
+                            # Reshape to 2D (note: GMRT may store row-major or column-major)
+                            # Try both orientations
+                            if z_data.size == nrows * ncols:
+                                # Reshape to 2D - try row-major first (C order)
+                                data = z_data.reshape((nrows, ncols), order='C')
+                                print(f"[DEBUG] Reshaped data to 2D: {data.shape}")
+                            else:
+                                print(f"[DEBUG] Data size mismatch: got {z_data.size}, expected {nrows * ncols}")
+                                return False
+                            
+                            # Create transform
+                            from rasterio.transform import from_bounds
+                            transform = from_bounds(lon_min, lat_min, lon_max, lat_max, ncols, nrows)
+                            print(f"[DEBUG] Transform: {transform}")
+                            
+                            # Only use tiled format if dimensions are compatible
+                            use_tiled = (nrows % 16 == 0) and (ncols % 16 == 0)
+                            
+                            # Create profile
+                            profile = {
+                                'driver': 'GTiff',
+                                'height': nrows,
+                                'width': ncols,
+                                'count': 1,
+                                'dtype': data.dtype,
+                                'crs': 'EPSG:4326',
+                                'transform': transform,
+                                'compress': 'lzw',
+                                'tiled': use_tiled
+                            }
+                            
+                            # If tiled, set appropriate block sizes
+                            if use_tiled:
+                                profile['blockxsize'] = min(512, ncols)
+                                profile['blockysize'] = min(512, nrows)
+                                profile['blockxsize'] = (profile['blockxsize'] // 16) * 16
+                                profile['blockysize'] = (profile['blockysize'] // 16) * 16
+                            
+                            # Handle nodata - check z_range or use default
+                            if 'z_range' in nc.variables:
+                                z_range = nc.variables['z_range'][:]
+                                # Often nodata is indicated by a specific value in z_range
+                                # For now, use a common nodata value
+                                profile['nodata'] = -99999
+                            else:
+                                profile['nodata'] = -99999
+                            
+                            # Write to GeoTIFF
+                            print(f"[DEBUG] Writing GeoTIFF to: {output_path}")
+                            with rasterio.open(output_path, 'w', **profile) as dst:
+                                dst.write(data, 1)
+                            
+                            print(f"[DEBUG] Successfully converted GMRT NetCDF to GeoTIFF")
+                            return True
+                        except Exception as e:
+                            print(f"[DEBUG] Error processing GMRT 1D format: {e}")
+                            import traceback
+                            print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+                            return False
+                    
+                    # Find the 2D data variable (standard NetCDF format)
+                    data_var = None
+                    for var_name in nc.variables:
+                        var = nc.variables[var_name]
+                        if len(var.dimensions) >= 2:
+                            data_var = var_name
+                            print(f"[DEBUG] Found 2D data variable: {data_var}")
+                            print(f"[DEBUG] Variable dimensions: {var.dimensions}")
+                            break
+                    
+                    if data_var is None:
+                        print(f"[DEBUG] No 2D variable found in NetCDF file")
+                        print(f"[DEBUG] All variables: {[(name, len(nc.variables[name].dimensions)) for name in nc.variables]}")
+                        return False
+                    
+                    # Get the data
+                    data = nc.variables[data_var][:]
+                    print(f"[DEBUG] Data shape: {data.shape}, dtype: {data.dtype}")
+                    if len(data.shape) == 3:
+                        data = data[0, :, :]
+                        print(f"[DEBUG] Reduced 3D to 2D, new shape: {data.shape}")
+                    
+                    # Get coordinates
+                    dims = nc.variables[data_var].dimensions
+                    print(f"[DEBUG] Data variable dimensions: {dims}")
+                    lat_var = None
+                    lon_var = None
+                    
+                    # Try to find coordinate variables
+                    for dim in dims:
+                        if dim in nc.variables:
+                            var = nc.variables[dim]
+                            if hasattr(var, 'standard_name'):
+                                std_name = var.standard_name.lower()
+                                print(f"[DEBUG] Dimension {dim} has standard_name: {std_name}")
+                                if 'lat' in std_name:
+                                    lat_var = dim
+                                elif 'lon' in std_name:
+                                    lon_var = dim
+                    
+                    # Fallback to common names - check dimension names first
+                    if lat_var is None:
+                        # Check if dimension names themselves are coordinates
+                        for dim in dims:
+                            if dim.lower() in ['lat', 'latitude', 'y']:
+                                if dim in nc.variables:
+                                    lat_var = dim
+                                    break
+                        # If not found, check all variables
+                        if lat_var is None:
+                            for name in ['lat', 'latitude', 'y']:
+                                if name in nc.variables:
+                                    lat_var = name
+                                    break
+                    
+                    if lon_var is None:
+                        for dim in dims:
+                            if dim.lower() in ['lon', 'longitude', 'x']:
+                                if dim in nc.variables:
+                                    lon_var = dim
+                                    break
+                        if lon_var is None:
+                            for name in ['lon', 'longitude', 'x']:
+                                if name in nc.variables:
+                                    lon_var = name
+                                    break
+                    
+                    print(f"[DEBUG] Found lat_var: {lat_var}, lon_var: {lon_var}")
+                    
+                    if lat_var is None or lon_var is None:
+                        print(f"[DEBUG] Could not find coordinate variables")
+                        print(f"[DEBUG] Available variables: {list(nc.variables.keys())}")
+                        print(f"[DEBUG] Data dimensions: {dims}")
+                        return False
+                    
+                    lats = nc.variables[lat_var][:]
+                    lons = nc.variables[lon_var][:]
+                    print(f"[DEBUG] Lats shape: {lats.shape}, Lons shape: {lons.shape}")
+                    print(f"[DEBUG] Lat range: {float(lats.min())} to {float(lats.max())}")
+                    print(f"[DEBUG] Lon range: {float(lons.min())} to {float(lons.max())}")
+                    
+                    # Calculate transform
+                    nrows, ncols = data.shape
+                    lat_min = float(lats.min())
+                    lat_max = float(lats.max())
+                    lon_min = float(lons.min())
+                    lon_max = float(lons.max())
+                    
+                    print(f"[DEBUG] Data shape: {nrows} rows x {ncols} cols")
+                    print(f"[DEBUG] Bounds: lon={lon_min:.6f} to {lon_max:.6f}, lat={lat_min:.6f} to {lat_max:.6f}")
+                    
+                    # Create transform
+                    from rasterio.transform import from_bounds
+                    transform = from_bounds(lon_min, lat_min, lon_max, lat_max, ncols, nrows)
+                    print(f"[DEBUG] Transform: {transform}")
+                    
+                    # Only use tiled format if dimensions are compatible
+                    # Tiled TIFF requires block dimensions to be multiples of 16
+                    use_tiled = (nrows % 16 == 0) and (ncols % 16 == 0)
+                    
+                    # Create profile
+                    profile = {
+                        'driver': 'GTiff',
+                        'height': nrows,
+                        'width': ncols,
+                        'count': 1,
+                        'dtype': data.dtype,
+                        'crs': 'EPSG:4326',
+                        'transform': transform,
+                        'compress': 'lzw',
+                        'tiled': use_tiled
+                    }
+                    
+                    # If tiled, set appropriate block sizes
+                    if use_tiled:
+                        profile['blockxsize'] = min(512, ncols)
+                        profile['blockysize'] = min(512, nrows)
+                        # Ensure block sizes are multiples of 16
+                        profile['blockxsize'] = (profile['blockxsize'] // 16) * 16
+                        profile['blockysize'] = (profile['blockysize'] // 16) * 16
+                    
+                    # Handle nodata
+                    if hasattr(nc.variables[data_var], '_FillValue'):
+                        nodata = float(nc.variables[data_var]._FillValue)
+                        profile['nodata'] = nodata
+                        print(f"[DEBUG] Using nodata value: {nodata}")
+                    
+                    # Write to GeoTIFF
+                    print(f"[DEBUG] Writing GeoTIFF to: {output_path}")
+                    with rasterio.open(output_path, 'w', **profile) as dst:
+                        dst.write(data, 1)
+                    
+                    print(f"[DEBUG] Successfully converted NetCDF to GeoTIFF")
+                    return True
+            except Exception as e:
+                print(f"[DEBUG] Error converting NetCDF with netCDF4: {e}")
+                import traceback
+                print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+                return False
+        
+        # If we got a rasterio source, use it
+        if src is not None:
+            try:
+                # Read the data
+                data = src.read(1)
+                
+                # Get bounds and CRS from source
+                src_bounds = src.bounds
+                src_crs = src.crs
+                src_transform = src.transform
+                
+                print(f"[DEBUG] Source bounds: {src_bounds}")
+                print(f"[DEBUG] Source CRS: {src_crs}")
+                print(f"[DEBUG] Source transform: {src_transform}")
+                
+                # Ensure CRS is EPSG:4326 (WGS84) for geographic data
+                # If source CRS is None or different, use EPSG:4326
+                output_crs = rasterio.crs.CRS.from_epsg(4326)
+                needs_reproject = False
+                
+                if src_crs is None:
+                    print(f"[DEBUG] Source CRS is None, using EPSG:4326 and recalculating transform")
+                    needs_reproject = True
+                elif not src_crs.is_geographic:
+                    print(f"[DEBUG] Warning: Source CRS is projected ({src_crs}), using EPSG:4326 and recalculating transform")
+                    needs_reproject = True
+                elif src_crs.to_epsg() != 4326:
+                    print(f"[DEBUG] Source CRS is geographic but not EPSG:4326 ({src_crs}), using EPSG:4326")
+                    needs_reproject = True
+                else:
+                    # Check if bounds look reasonable for geographic coordinates
+                    # Geographic bounds should be: lon -180 to 180, lat -90 to 90
+                    if (src_bounds[0] < -200 or src_bounds[2] > 200 or 
+                        src_bounds[1] < -100 or src_bounds[3] > 100):
+                        print(f"[DEBUG] Warning: Bounds look wrong for geographic CRS, recalculating transform")
+                        print(f"[DEBUG] Bounds: {src_bounds}")
+                        needs_reproject = True
+                
+                # Only use tiled format if dimensions are compatible
+                # Tiled TIFF requires block dimensions to be multiples of 16
+                height, width = data.shape
+                use_tiled = (height % 16 == 0) and (width % 16 == 0)
+                
+                # If we need to recalculate transform, we need to get bounds from NetCDF metadata
+                # For now, if bounds look wrong, try to use the transform as-is but with correct CRS
+                # The issue is that we don't have the original geographic bounds from the NetCDF
+                # when opened via GDAL pattern. We should fall back to netCDF4 approach if this happens.
+                if needs_reproject:
+                    print(f"[DEBUG] Cannot recalculate transform without original bounds, falling back to netCDF4 approach")
+                    src.close()
+                    # Fall through to netCDF4 approach
+                    src = None
+                else:
+                    # Create profile with correct CRS and transform
+                    profile = {
+                        'driver': 'GTiff',
+                        'height': height,
+                        'width': width,
+                        'count': 1,
+                        'dtype': data.dtype,
+                        'crs': output_crs,
+                        'transform': src_transform,
+                        'compress': 'lzw',
+                        'tiled': use_tiled
+                    }
+                    
+                    # Copy nodata if present
+                    if src.nodata is not None:
+                        profile['nodata'] = src.nodata
+                    
+                    # If tiled, set appropriate block sizes
+                    if use_tiled:
+                        # Use standard block sizes that are multiples of 16
+                        profile['blockxsize'] = min(512, width)
+                        profile['blockysize'] = min(512, height)
+                        # Ensure block sizes are multiples of 16
+                        profile['blockxsize'] = (profile['blockxsize'] // 16) * 16
+                        profile['blockysize'] = (profile['blockysize'] // 16) * 16
+                    
+                    print(f"[DEBUG] Writing GeoTIFF with tiled={use_tiled}, shape={data.shape}, CRS={output_crs}")
+                    print(f"[DEBUG] Output bounds will be: {src_bounds}")
+                    # Write to GeoTIFF
+                    with rasterio.open(output_path, 'w', **profile) as dst:
+                        dst.write(data, 1)
+                    src.close()
+                    print(f"[DEBUG] Successfully wrote GeoTIFF")
+                    return True
+            except Exception as e:
+                print(f"[DEBUG] Error writing GeoTIFF from rasterio source: {e}")
+                import traceback
+                print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+                if src:
+                    src.close()
+                return False
+        
+        print(f"[DEBUG] Could not open NetCDF file with any method")
+        return False
+        
+    except Exception as e:
+        print(f"[DEBUG] Error converting NetCDF to GeoTIFF: {e}")
+        import traceback
+        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+        return False
+
+
+def convert_geotiff_to_esri_ascii(geotiff_path, output_path):
+    """
+    Convert GeoTIFF file directly to ESRI ASCII grid format.
+    
+    Args:
+        geotiff_path (str): Path to input GeoTIFF file
+        output_path (str): Path to output ESRI ASCII file
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if rasterio is None:
+        print(f"[DEBUG] Cannot convert GeoTIFF to ESRI ASCII: rasterio not available")
+        return False
+    
+    try:
+        with rasterio.open(geotiff_path) as src:
+            data = src.read(1)  # Read first band
+            transform = src.transform
+            bounds = src.bounds
+            nodata = src.nodata
+            
+            # Get corner coordinates
+            xllcorner = bounds.left
+            yllcorner = bounds.bottom
+            ncols = data.shape[1]  # width (east-west)
+            nrows = data.shape[0]  # height (north-south)
+            
+            # Calculate cell size from actual bounds and dimensions
+            # ESRI ASCII uses a single cellsize value, so we calculate it from the actual extent
+            # For geographic coordinates, X and Y cell sizes may differ, so we calculate both
+            cell_size_x = (bounds.right - bounds.left) / ncols
+            cell_size_y = (bounds.top - bounds.bottom) / nrows
+            
+            # ESRI ASCII format uses a single cellsize for both X and Y dimensions
+            # Since east-west bounds are correct, use cell_size_x
+            # However, if cells are rectangular, using X cell size for Y dimension will cause stretching
+            # Adjust yllcorner so that yllcorner + nrows * cell_size_x = bounds.top (correct north extent)
+            cell_size = cell_size_x
+            
+            # Calculate what yllcorner should be to match the actual north bound when using X cell size
+            # ESRI ASCII calculates: north_extent = yllcorner + nrows * cellsize
+            # We want: north_extent = bounds.top
+            # So: yllcorner = bounds.top - nrows * cell_size
+            yllcorner_adjusted = bounds.top - nrows * cell_size
+            
+            print(f"[DEBUG] ESRI ASCII conversion: calculated cell_size_x={cell_size_x:.9f}°, cell_size_y={cell_size_y:.9f}°")
+            print(f"[DEBUG] Using cell_size={cell_size:.9f}° for ESRI ASCII (using X cell size since east-west is correct)")
+            print(f"[DEBUG] Original yllcorner={yllcorner:.9f}°, adjusted yllcorner={yllcorner_adjusted:.9f}°")
+            print(f"[DEBUG] Calculated north extent with adjusted yllcorner: {yllcorner_adjusted + nrows * cell_size:.9f}°, actual bounds.top: {bounds.top:.9f}°")
+            
+            yllcorner = yllcorner_adjusted
+            
+            # Replace NaN and nodata values with ESRI ASCII nodata value BEFORE any transformations
+            nodata_value = -9999
+            if nodata is not None:
+                data = np.where(data == nodata, nodata_value, data)
+            data = np.where(np.isnan(data), nodata_value, data)
+            data = np.where(np.isinf(data), nodata_value, data)
+            
+            # ESRI ASCII format expects:
+            # - First row in file = northernmost row (top)
+            # - Each row = west to east (left to right)
+            # - Data written top to bottom (north to south)
+            # Rasterio data: shape (height, width) = (nrows, ncols)
+            # - First row (index 0) = northernmost row
+            # - Each row = west to east
+            # This matches ESRI ASCII format, so write as-is (no flip, no transpose)
+            
+            # Write ESRI ASCII format (explicitly use ASCII/UTF-8 encoding for text)
+            with open(output_path, 'w', encoding='ascii', errors='replace') as f:
+                f.write(f"ncols {ncols}\n")
+                f.write(f"nrows {nrows}\n")
+                f.write(f"xllcorner {xllcorner:.6f}\n")
+                f.write(f"yllcorner {yllcorner:.6f}\n")
+                f.write(f"cellsize {cell_size:.6f}\n")
+                f.write(f"NODATA_value {nodata_value}\n")
+                np.savetxt(f, data, fmt='%.6f')
+        
+        print(f"[DEBUG] Successfully converted GeoTIFF to ESRI ASCII: {output_path}")
+        return True
+    except Exception as e:
+        print(f"[DEBUG] Error converting GeoTIFF to ESRI ASCII: {e}")
+        import traceback
+        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+        return False
+
+
+def convert_netcdf_to_esri_ascii(netcdf_path, output_path):
+    """
+    Convert NetCDF file to ESRI ASCII grid format.
+    This function is kept for backward compatibility or if needed for NetCDF inputs.
+    
+    Args:
+        netcdf_path (str): Path to input NetCDF file
+        output_path (str): Path to output ESRI ASCII file
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if rasterio is None or netCDF4 is None:
+        return False
+    
+    try:
+        # Try opening with rasterio first
+        try:
+            with rasterio.open(netcdf_path) as src:
+                data = src.read(1)
+                transform = src.transform
+                bounds = src.bounds
+                crs = src.crs
+                
+                # Calculate cell size
+                cell_size = abs(transform[0])
+                xllcorner = bounds.left
+                yllcorner = bounds.bottom
+                ncols = data.shape[1]
+                nrows = data.shape[0]
+                
+        except:
+            # Fallback to netCDF4
+            with netCDF4.Dataset(netcdf_path, 'r') as nc:
+                # Find data variable
+                data_var = None
+                for var_name in nc.variables:
+                    var = nc.variables[var_name]
+                    if len(var.dimensions) >= 2:
+                        data_var = var_name
+                        break
+                
+                if data_var is None:
+                    return False
+                
+                data = nc.variables[data_var][:]
+                if len(data.shape) == 3:
+                    data = data[0, :, :]
+                
+                # Get coordinates
+                dims = nc.variables[data_var].dimensions
+                lat_var = None
+                lon_var = None
+                for dim in dims:
+                    if dim in nc.variables:
+                        var = nc.variables[dim]
+                        if hasattr(var, 'standard_name'):
+                            if 'lat' in var.standard_name.lower():
+                                lat_var = dim
+                            elif 'lon' in var.standard_name.lower():
+                                lon_var = dim
+                
+                # Fallback names
+                if lat_var is None:
+                    for name in ['lat', 'latitude', 'y']:
+                        if name in nc.variables:
+                            lat_var = name
+                            break
+                if lon_var is None:
+                    for name in ['lon', 'longitude', 'x']:
+                        if name in nc.variables:
+                            lon_var = name
+                            break
+                
+                if lat_var is None or lon_var is None:
+                    return False
+                
+                lats = nc.variables[lat_var][:]
+                lons = nc.variables[lon_var][:]
+                
+                nrows, ncols = data.shape
+                cell_size = abs(float(lons[1] - lons[0])) if len(lons) > 1 else 0.01
+                xllcorner = float(lons.min())
+                yllcorner = float(lats.min())
+        
+        # Flip data vertically (ESRI ASCII uses bottom-to-top)
+        data = np.flipud(data)
+        
+        # Replace NaN with nodata value
+        nodata_value = -9999
+        data = np.where(np.isnan(data), nodata_value, data)
+        
+        # Write ESRI ASCII format (explicitly use ASCII/UTF-8 encoding for text)
+        with open(output_path, 'w', encoding='ascii', errors='replace') as f:
+            f.write(f"ncols {ncols}\n")
+            f.write(f"nrows {nrows}\n")
+            f.write(f"xllcorner {xllcorner:.6f}\n")
+            f.write(f"yllcorner {yllcorner:.6f}\n")
+            f.write(f"cellsize {cell_size:.6f}\n")
+            f.write(f"NODATA_value {nodata_value}\n")
+            np.savetxt(f, data, fmt='%.6f')
+        
+        return True
+    except Exception as e:
+        print(f"[DEBUG] Error converting NetCDF to ESRI ASCII: {e}")
+        import traceback
+        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+        return False
+
+
+def convert_netcdf_to_coards(netcdf_path, output_path):
+    """
+    Convert NetCDF file to COARDS format (which is also NetCDF-based).
+    COARDS (Cooperative Ocean/Atmosphere Research Data Service) is a NetCDF convention.
+    This ensures the file follows COARDS conventions.
+    
+    Args:
+        netcdf_path (str): Path to input NetCDF file
+        output_path (str): Path to output COARDS file
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if netCDF4 is None:
+        return False
+    
+    try:
+        # Open source NetCDF
+        with netCDF4.Dataset(netcdf_path, 'r') as src:
+            # Create output COARDS-compliant NetCDF
+            with netCDF4.Dataset(output_path, 'w', format='NETCDF4') as dst:
+                # Copy dimensions
+                for dim_name, dim in src.dimensions.items():
+                    if dim.isunlimited():
+                        dst.createDimension(dim_name, None)
+                    else:
+                        dst.createDimension(dim_name, len(dim))
+                
+                # Copy variables
+                for var_name, var in src.variables.items():
+                    # Extract _FillValue if it exists (must be set at creation time)
+                    fill_value = None
+                    if '_FillValue' in var.ncattrs():
+                        fill_value = var.getncattr('_FillValue')
+                    
+                    # Create variable with fill_value if it exists
+                    if fill_value is not None:
+                        dst_var = dst.createVariable(var_name, var.datatype, var.dimensions, fill_value=fill_value)
+                    else:
+                        dst_var = dst.createVariable(var_name, var.datatype, var.dimensions)
+                    
+                    # Copy data
+                    dst_var[:] = var[:]
+                    
+                    # Copy attributes (skip _FillValue as it's already set)
+                    for attr_name in var.ncattrs():
+                        if attr_name != '_FillValue':  # Skip _FillValue as it's set at creation
+                            dst_var.setncattr(attr_name, var.getncattr(attr_name))
+                    
+                    # Ensure COARDS compliance for coordinate variables
+                    if var_name.lower() in ['lon', 'longitude', 'x']:
+                        if 'units' not in var.ncattrs():
+                            dst_var.units = 'degrees_east'
+                        if 'long_name' not in var.ncattrs():
+                            dst_var.long_name = 'longitude'
+                    elif var_name.lower() in ['lat', 'latitude', 'y']:
+                        if 'units' not in var.ncattrs():
+                            dst_var.units = 'degrees_north'
+                        if 'long_name' not in var.ncattrs():
+                            dst_var.long_name = 'latitude'
+                
+                # Copy global attributes
+                for attr_name in src.ncattrs():
+                    dst.setncattr(attr_name, src.getncattr(attr_name))
+                
+                # Add COARDS convention attribute
+                if 'Conventions' in dst.ncattrs():
+                    conventions = dst.getncattr('Conventions')
+                    if 'COARDS' not in str(conventions):
+                        dst.Conventions = f"{conventions}, COARDS"
+                else:
+                    dst.Conventions = 'COARDS'
+        
+        print(f"[DEBUG] Successfully converted NetCDF to COARDS: {output_path}")
+        return True
+    except Exception as e:
+        print(f"[DEBUG] Error converting NetCDF to COARDS: {e}")
+        import traceback
+        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+        return False
+
+
+def convert_geotiff_to_coards(geotiff_path, output_path):
+    """
+    Convert GeoTIFF file to COARDS format.
+    First converts to NetCDF, then ensures COARDS compliance.
+    
+    Args:
+        geotiff_path (str): Path to input GeoTIFF file
+        output_path (str): Path to output COARDS file
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if rasterio is None or netCDF4 is None:
+        print(f"[DEBUG] Cannot convert GeoTIFF to COARDS: rasterio or netCDF4 not available")
+        return False
+    
+    try:
+        # First convert GeoTIFF to NetCDF
+        import tempfile
+        temp_netcdf = tempfile.NamedTemporaryFile(suffix='.nc', delete=False)
+        temp_netcdf_path = temp_netcdf.name
+        temp_netcdf.close()
+        
+        try:
+            # Convert GeoTIFF to NetCDF
+            if not convert_geotiff_to_netcdf(geotiff_path, temp_netcdf_path):
+                print(f"[DEBUG] Failed to convert GeoTIFF to NetCDF for COARDS conversion")
+                return False
+            
+            # Convert NetCDF to COARDS
+            if not convert_netcdf_to_coards(temp_netcdf_path, output_path):
+                print(f"[DEBUG] Failed to convert NetCDF to COARDS")
+                return False
+            
+            print(f"[DEBUG] Successfully converted GeoTIFF to COARDS: {output_path}")
+            return True
+        finally:
+            # Clean up temporary NetCDF file
+            try:
+                if os.path.exists(temp_netcdf_path):
+                    os.remove(temp_netcdf_path)
+            except Exception as e:
+                print(f"[DEBUG] Warning: Could not delete temporary NetCDF file: {e}")
+                
+    except Exception as e:
+        print(f"[DEBUG] Error converting GeoTIFF to COARDS: {e}")
+        import traceback
+        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+        return False
+
+
+def convert_geotiff_to_netcdf(geotiff_path, output_path):
+    """
+    Convert GeoTIFF file to NetCDF format.
+    
+    Args:
+        geotiff_path (str): Path to input GeoTIFF file
+        output_path (str): Path to output NetCDF file
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if rasterio is None or netCDF4 is None:
+        print(f"[DEBUG] Cannot convert GeoTIFF to NetCDF: rasterio or netCDF4 not available")
+        return False
+    
+    try:
+        # Open GeoTIFF with rasterio
+        with rasterio.open(geotiff_path) as src:
+            data = src.read(1)  # Read first band
+            transform = src.transform
+            crs = src.crs
+            nodata = src.nodata
+            
+            # Get dimensions
+            height, width = data.shape
+            
+            # Get bounds
+            bounds = src.bounds
+            lon_min = bounds.left
+            lon_max = bounds.right
+            lat_min = bounds.bottom
+            lat_max = bounds.top
+            
+            # Calculate cell sizes
+            cell_size_lon = (lon_max - lon_min) / width
+            cell_size_lat = (lat_max - lat_min) / height
+            
+            # Create coordinate arrays
+            lons = np.linspace(lon_min + cell_size_lon/2, lon_max - cell_size_lon/2, width)
+            lats = np.linspace(lat_min + cell_size_lat/2, lat_max - cell_size_lat/2, height)
+            
+            # Create NetCDF file
+            with netCDF4.Dataset(output_path, 'w', format='NETCDF4') as nc:
+                # Create dimensions
+                nc.createDimension('lon', width)
+                nc.createDimension('lat', height)
+                
+                # Create coordinate variables
+                lon_var = nc.createVariable('lon', 'f4', ('lon',))
+                lat_var = nc.createVariable('lat', 'f4', ('lat',))
+                lon_var[:] = lons
+                lat_var[:] = lats
+                
+                # Set coordinate attributes
+                lon_var.units = 'degrees_east'
+                lon_var.long_name = 'longitude'
+                lon_var.standard_name = 'longitude'
+                lat_var.units = 'degrees_north'
+                lat_var.long_name = 'latitude'
+                lat_var.standard_name = 'latitude'
+                
+                # Create data variable with fill_value set at creation time
+                fill_value = float(nodata) if nodata is not None else -99999.0
+                data_var = nc.createVariable('z', 'f4', ('lat', 'lon'), fill_value=fill_value)
+                data_var[:] = data
+                data_var.units = 'meters'
+                data_var.long_name = 'elevation'
+                data_var.standard_name = 'height'
+                
+                # Set global attributes
+                nc.title = 'Bathymetry/Topography Data'
+                nc.source = 'GMRT GridServer'
+                nc.Conventions = 'CF-1.6'
+                if crs:
+                    nc.geospatial_lat_min = float(lat_min)
+                    nc.geospatial_lat_max = float(lat_max)
+                    nc.geospatial_lon_min = float(lon_min)
+                    nc.geospatial_lon_max = float(lon_max)
+                    if crs.to_epsg() == 4326:
+                        nc.geospatial_crs = 'EPSG:4326'
+        
+        print(f"[DEBUG] Successfully converted GeoTIFF to NetCDF: {output_path}")
+        return True
+    except Exception as e:
+        print(f"[DEBUG] Error converting GeoTIFF to NetCDF: {e}")
+        import traceback
+        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+        return False
+
+
 class DownloadWorker(QThread):
     """
     Worker thread for downloading bathymetry data files from GMRT GridServer.
     
     This class runs in a separate thread to prevent the GUI from freezing
     during large file downloads. It handles streaming downloads and provides
-    detailed error messages for different failure scenarios.
+    detailed error messages for various failure scenarios. It downloads
+    directly as GeoTIFF format.
     """
     # Signals to communicate with the main thread
     finished = pyqtSignal(bool, str)  # (success, filename/error_message)
     
-    def __init__(self, params, filename):
+    def __init__(self, params, filename, requested_format=None):
         """
         Initialize the download worker with request parameters and target filename.
         
         Args:
-            params (dict): Parameters for the GMRT GridServer API request
-            filename (str): Full path where the downloaded file should be saved
+            params (dict): Parameters for the GMRT GridServer API request (format will be set to 'geotiff')
+            filename (str): Full path where the final file should be saved
+            requested_format (str): Not used (kept for compatibility, downloads as GeoTIFF)
         """
         super().__init__()
-        self.params = params
-        self.filename = filename
+        # Always download as GeoTIFF
+        self.params = params.copy()
+        self.params['format'] = 'geotiff'
+        self.filename = filename  # Final output filename
+        self.requested_format = requested_format  # Kept for compatibility but not used
     
     def get_error_message(self, status_code):
         """
@@ -855,16 +1885,60 @@ class DownloadWorker(QThread):
                 print(f"[DEBUG] DownloadWorker.run: response status {r.status_code}")
                 if r.status_code == 200:
                     # Successfully connected, download the file in chunks
+                    # Download to temporary GeoTIFF file first
+                    temp_geotiff = tempfile.NamedTemporaryFile(suffix='.tif', delete=False)
+                    temp_geotiff_path = temp_geotiff.name
+                    temp_geotiff.close()
+                    
                     total_bytes = 0
-                    with open(self.filename, 'wb') as f:
+                    with open(temp_geotiff_path, 'wb') as f:
                         for chunk in r.iter_content(chunk_size=8192):  # 8KB chunks
                             if chunk:
                                 f.write(chunk)
                                 total_bytes += len(chunk)
                     
-                    print(f"[DownloadWorker] Grid download completed successfully ({total_bytes} bytes)")
+                    print(f"[DownloadWorker] GeoTIFF download completed successfully ({total_bytes} bytes)")
+                    
+                    # Check if temp file exists and has content
+                    if not os.path.exists(temp_geotiff_path):
+                        error_msg = f"Temporary GeoTIFF file not found: {temp_geotiff_path}"
+                        print(f"[DownloadWorker] {error_msg}")
+                        self.finished.emit(False, error_msg)
+                        return
+                    
+                    file_size = os.path.getsize(temp_geotiff_path)
+                    print(f"[DownloadWorker] Temp GeoTIFF file size: {file_size} bytes")
+                    if file_size == 0:
+                        error_msg = f"Downloaded GeoTIFF file is empty"
+                        print(f"[DownloadWorker] {error_msg}")
+                        try:
+                            os.remove(temp_geotiff_path)
+                        except:
+                            pass
+                        self.finished.emit(False, error_msg)
+                        return
+                    
+                    # Move the downloaded GeoTIFF file to the final location
+                    try:
+                        if temp_geotiff_path != self.filename:
+                            shutil.move(temp_geotiff_path, self.filename)
+                        else:
+                            # Already at correct location
+                            pass
+                    except Exception as e:
+                        print(f"[DownloadWorker] Error moving GeoTIFF file: {e}")
+                        # Try copy instead
+                        try:
+                            shutil.copy2(temp_geotiff_path, self.filename)
+                            os.remove(temp_geotiff_path)
+                        except Exception as e2:
+                            error_msg = f"Error saving GeoTIFF file: {e2}"
+                            print(f"[DownloadWorker] {error_msg}")
+                            self.finished.emit(False, error_msg)
+                            return
                     
                     # Download completed successfully
+                    print(f"[DownloadWorker] Successfully downloaded GeoTIFF file")
                     self.finished.emit(True, self.filename)
                 else:
                     # Handle HTTP error responses
@@ -939,6 +2013,12 @@ class GMRTGrabber(QWidget):
         self.download_timer = QTimer()
         self.download_timer.timeout.connect(self.download_next_tile)
         print("[DEBUG] Initialized download timer")
+        
+        # Timer for debouncing map preview updates when typing coordinates
+        self.map_preview_timer = QTimer()
+        self.map_preview_timer.setSingleShot(True)  # Only fire once
+        self.map_preview_timer.timeout.connect(self.update_map_preview)
+        print("[DEBUG] Initialized map preview debounce timer")
         # Configuration and state management
         self.config_file = os.path.join(os.path.dirname(__file__), "gmrtgrab_config.json")
         print(f"[DEBUG] Config file path: {self.config_file}")
@@ -1060,28 +2140,28 @@ class GMRTGrabber(QWidget):
         self.west_spin = QDoubleSpinBox()
         self.west_spin.setRange(-180, 180)  # Valid longitude range
         self.west_spin.setDecimals(6)       # 6 decimal places for precision
-        self.west_spin.valueChanged.connect(self.update_map_preview)  # Auto-update map
+        self.west_spin.valueChanged.connect(self.on_coordinate_changed)  # Debounced update
         aoi_form.addRow("West (min lon)", self.west_spin)
 
         # Eastern boundary (maximum longitude)
         self.east_spin = QDoubleSpinBox()
         self.east_spin.setRange(-180, 180)  # Valid longitude range
         self.east_spin.setDecimals(6)       # 6 decimal places for precision
-        self.east_spin.valueChanged.connect(self.update_map_preview)  # Auto-update map
+        self.east_spin.valueChanged.connect(self.on_coordinate_changed)  # Debounced update
         aoi_form.addRow("East (max lon)", self.east_spin)
 
         # Southern boundary (minimum latitude)
         self.south_spin = QDoubleSpinBox()
         self.south_spin.setRange(-85, 85)   # Valid latitude range (GMRT data limit)
         self.south_spin.setDecimals(6)      # 6 decimal places for precision
-        self.south_spin.valueChanged.connect(self.update_map_preview)  # Auto-update map
+        self.south_spin.valueChanged.connect(self.on_coordinate_changed)  # Debounced update
         aoi_form.addRow("South (min lat)", self.south_spin)
 
         # Northern boundary (maximum latitude)
         self.north_spin = QDoubleSpinBox()
         self.north_spin.setRange(-85, 85)   # Valid latitude range (GMRT data limit)
         self.north_spin.setDecimals(6)      # 6 decimal places for precision
-        self.north_spin.valueChanged.connect(self.update_map_preview)  # Auto-update map
+        self.north_spin.valueChanged.connect(self.on_coordinate_changed)  # Debounced update
         aoi_form.addRow("North (max lat)", self.north_spin)
 
         aoi_group.setLayout(aoi_form)
@@ -1097,12 +2177,11 @@ class GMRTGrabber(QWidget):
         # Different formats are suitable for different applications
         self.format_combo = QComboBox()
         self.format_combo.addItems([
-            "geotiff",    # GeoTIFF - Raster format with embedded georeference
-            "netcdf",     # NetCDF - Scientific data format with metadata
-            "coards",     # COARDS - ASCII grid format
-            "esriascii"   # ESRI ASCII - Simple ASCII grid format
+            "GeoTIFF",           # GeoTIFF - Raster format with embedded georeference
+            "NetCDF",            # NetCDF - Scientific data format with metadata
+            "NetCDF (COARDS)"    # COARDS - NetCDF convention for oceanographic/atmospheric data
         ])
-        grid_form.addRow("Format", self.format_combo)
+        grid_form.addRow("Output Format", self.format_combo)
 
         # Cell resolution selection
         # Allows users to specify meter-per-pixel resolution
@@ -1118,7 +2197,7 @@ class GMRTGrabber(QWidget):
             "Topo-Bathy",                    # Topography - Standard bathymetry data
             "Topo-Bathy (Observed Only)"     # Topography with mask - High-resolution data only
         ])
-        grid_form.addRow("Layer", self.layer_combo)
+        grid_form.addRow("GMRT Source", self.layer_combo)
 
         # Split Bathymetry/Topography option
         # When enabled, downloaded grids will be split into topography (>=0) and bathymetry (<0) files
@@ -1132,62 +2211,8 @@ class GMRTGrabber(QWidget):
         grid_group.setLayout(grid_form)
         form_layout.addRow(grid_group)
 
-        # Tiling Parameters subgroup inside Download Parameters
-        tiling_group = QGroupBox("Tiling Parameters")
-        tiling_form = QFormLayout()
-
-        # Tiled download option
-        # For large areas, breaking into tiles can prevent timeouts and improve reliability
-        self.tile_checkbox = QCheckBox("Tile Dataset for Download")
-        self.tile_checkbox.setToolTip(
-            "Break large datasets into tiles with configurable size and automatic overlap based on cell resolution"
-        )
-        tiling_form.addRow(self.tile_checkbox)
-        
-        # Tile size parameter
-        self.tile_size_combo = QComboBox()
-        self.tile_size_combo.addItems(["1", "2", "3", "4"])
-        self.tile_size_combo.setCurrentText("2")  # Default to 2 degrees
-        self.tile_size_combo.setToolTip(
-            "Size of each tile in degrees (applies when tiling is enabled)"
-        )
-        tiling_form.addRow("Tile Size (deg)", self.tile_size_combo)
-
-        # Mosaic tiles option
-        # When enabled, automatically assemble all tiles into a single GeoTIFF
-        self.mosaic_checkbox = QCheckBox("Mosaic Downloaded Tiles")
-        self.mosaic_checkbox.setChecked(True)  # Default to checked
-        self.mosaic_checkbox.setToolTip(
-            "Automatically assemble all tiles into a single GeoTIFF file"
-        )
-        tiling_form.addRow(self.mosaic_checkbox)
-        
-        # Delete tiles option
-        # When enabled, individual tile files are deleted after mosaicking
-        self.delete_tiles_checkbox = QCheckBox("Delete Tiles After Mosaicing")
-        self.delete_tiles_checkbox.setChecked(True)  # Start checked by default
-        self.delete_tiles_checkbox.setToolTip(
-            "Delete individual tile files after mosaicking (only applies when mosaicking is enabled)"
-        )
-        tiling_form.addRow(self.delete_tiles_checkbox)
-
-        tiling_group.setLayout(tiling_form)
-        form_layout.addRow(tiling_group)
-        
-        # Connect tile checkbox to enable/disable mosaic checkbox
-        self.tile_checkbox.toggled.connect(self.on_tile_checkbox_toggled)
-        # Connect mosaic checkbox to enable/disable delete tiles checkbox
-        self.mosaic_checkbox.toggled.connect(self.on_mosaic_checkbox_toggled)
-        
-        # Connect coordinate spinboxes to update tile checkbox availability
-        self.west_spin.valueChanged.connect(self.update_tile_checkbox_availability)
-        self.east_spin.valueChanged.connect(self.update_tile_checkbox_availability)
-        self.south_spin.valueChanged.connect(self.update_tile_checkbox_availability)
-        self.north_spin.valueChanged.connect(self.update_tile_checkbox_availability)
-        
-        # React to tile size changes and run initial availability check
-        self.tile_size_combo.currentTextChanged.connect(self.update_tile_checkbox_availability)
-        self.update_tile_checkbox_availability()
+        # Tiling is now automatic when area exceeds 2 degrees in either dimension
+        # Tile size is always 2 degrees (no UI parameter needed)
 
         # Complete the grid parameters section
         form_group.setLayout(form_layout)
@@ -1343,18 +2368,19 @@ class GMRTGrabber(QWidget):
         self.east_spin.blockSignals(False)
         self.south_spin.blockSignals(False)
         self.north_spin.blockSignals(False)
-        # Refresh tile availability and tooltips now that defaults are set
-        try:
-            self.update_tile_checkbox_availability()
-        except Exception:
-            pass
         # Call update_map_preview once after all values are set
         self.update_map_preview()
         
-        # Set initial state of mosaic checkbox (disabled since tile dataset starts unchecked)
-        self.mosaic_checkbox.setEnabled(False)
-        # Set initial state of delete tiles checkbox (disabled since mosaic starts disabled)
-        self.delete_tiles_checkbox.setEnabled(False)
+
+    def on_coordinate_changed(self):
+        """
+        Handle coordinate value changes with debouncing.
+        Restarts the timer so update_map_preview is only called after user stops typing.
+        """
+        # Stop the timer if it's running and restart it
+        # This ensures update_map_preview is only called 500ms after the user stops typing
+        self.map_preview_timer.stop()
+        self.map_preview_timer.start(500)  # 500ms delay
 
     def update_map_preview(self):
         print("[DEBUG] Entering update_map_preview")
@@ -1486,102 +2512,8 @@ class GMRTGrabber(QWidget):
         self.log_message("Log cleared")
 
 
-    def on_tile_checkbox_toggled(self, checked):
-        """Enable/disable mosaic checkbox based on tile dataset checkbox"""
-        self.mosaic_checkbox.setEnabled(checked)
-        if not checked:
-            # If tile dataset is unchecked, also uncheck mosaic tiles
-            self.mosaic_checkbox.setChecked(False)
-
-    def on_mosaic_checkbox_toggled(self, checked):
-        """Enable/disable delete tiles checkbox based on mosaic checkbox"""
-        self.delete_tiles_checkbox.setEnabled(checked)
-        # Force a visual update and repaint
-        self.delete_tiles_checkbox.update()
-        self.delete_tiles_checkbox.repaint()
-        # Don't automatically check/uncheck - let user control it
-
-    def update_tile_checkbox_availability(self):
-        """Enable/disable tile checkbox based on grid size"""
-        try:
-            west = self.west_spin.value()
-            east = self.east_spin.value()
-            south = self.south_spin.value()
-            north = self.north_spin.value()
-            
-            # Calculate grid dimensions
-            lon_span = east - west
-            lat_span = north - south
-            
-            # Use configured tile size if available, otherwise default to 2.0 degrees
-            try:
-                tile_size = float(self.tile_size_combo.currentText())
-            except Exception:
-                tile_size = 2.0
-            
-            # Enable tiling if grid is larger than tile size in any dimension
-            should_enable_tiling = (lon_span > tile_size) or (lat_span > tile_size)
-            
-            # Update checkbox state
-            self.tile_checkbox.setEnabled(should_enable_tiling)
-            
-            # Automatically check the checkbox if area is larger than tile size
-            if should_enable_tiling and not self.tile_checkbox.isChecked():
-                self.tile_checkbox.setChecked(True)
-                self.log_message(f"Tiling automatically enabled: Grid area ({lon_span:.1f}° x {lat_span:.1f}°) is larger than tile size ({tile_size} degrees)")
-            
-            # If tiling is disabled and currently checked, uncheck it
-            if not should_enable_tiling and self.tile_checkbox.isChecked():
-                self.tile_checkbox.setChecked(False)
-                self.log_message(f"Tiling disabled: Grid area is smaller than tile size ({tile_size} degrees)")
-            
-            # Update tooltip based on availability
-            if should_enable_tiling:
-                self.tile_checkbox.setToolTip(
-                    f"Break large dataset ({lon_span:.1f}° x {lat_span:.1f}°) into {tile_size}° tiles with configurable overlap"
-                )
-            else:
-                self.tile_checkbox.setToolTip(
-                    f"Tiling not available: Grid area ({lon_span:.1f}° x {lat_span:.1f}°) is smaller than tile size ({tile_size} degrees)"
-                )
-                
-        except Exception as e:
-            # If there's an error, enable the checkbox to avoid breaking the UI
-            self.tile_checkbox.setEnabled(True)
-            print(f"[DEBUG] Error updating tile checkbox availability: {e}")
 
 
-    def check_large_grid_warning(self):
-        """Check if user should be warned about large grids"""
-        west = self.west_spin.value()
-        east = self.east_spin.value()
-        south = self.south_spin.value()
-        north = self.north_spin.value()
-        
-        lon_span = abs(east - west)
-        lat_span = abs(north - south)
-        
-        mres_value = float(self.mres_combo.currentText())
-        is_high_res = mres_value <= 200  # Consider 100 or 200 as high resolution
-        
-        if is_high_res and (lon_span > 3 or lat_span > 3) and not self.tile_checkbox.isChecked():
-            reply = QMessageBox.question(
-                self, 
-                "Large Grid Warning",
-                f"Your grid spans {lon_span:.1f}° longitude and {lat_span:.1f}° latitude.\n"
-                f"Downloading at {mres_value} meters/pixel resolution may result in very large files.\n\n"
-                f"Consider enabling 'Tile Dataset for Download' to break this into smaller tiles.\n\n"
-                f"Continue with single download?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                self.log_message("User chose to continue with single download")
-            else:
-                self.log_message("User cancelled download")
-            return reply == QMessageBox.StandardButton.Yes
-        else:
-            return True
 
     def calculate_overlap_from_resolution(self):
         """
@@ -1627,11 +2559,8 @@ class GMRTGrabber(QWidget):
             overlap = self.calculate_overlap_from_resolution()
             self.log_message(f"Auto-calculated overlap: {overlap:.6f} degrees (2 cells at {self.mres_combo.currentText()}m resolution)")
         
-        # Calculate tile size from UI if available, else default to 2.0 degrees
-        try:
-            tile_size = float(self.tile_size_combo.currentText())
-        except Exception:
-            tile_size = 2.0
+        # Tile size is always 2.0 degrees
+        tile_size = 2.0
         
         # Generate longitude tiles (without overlap applied yet)
         lon_tiles = []
@@ -1708,16 +2637,25 @@ class GMRTGrabber(QWidget):
         
         return tiles
 
-    def download_single_grid(self, params, filename, callback=None):
-        """Download a single grid file using worker thread"""
+    def download_single_grid(self, params, filename, callback=None, requested_format=None):
+        """
+        Download a single grid file using worker thread.
+        Downloads directly as GeoTIFF format.
+        
+        Args:
+            params: Parameters for API request (format will be set to 'geotiff')
+            filename: Final output filename
+            callback: Callback function when download completes
+            requested_format: Not used (kept for compatibility, downloads as GeoTIFF)
+        """
         if self.current_worker and self.current_worker.isRunning():
             return False  # Already downloading
         
         # Log the request parameters for debugging
         param_str = ", ".join([f"{k}={v}" for k, v in params.items()])
-        self.log_message(f"Making request: {param_str}")
+        self.log_message(f"Making request (will download as GeoTIFF): {param_str}")
         
-        self.current_worker = DownloadWorker(params, filename)
+        self.current_worker = DownloadWorker(params, filename, requested_format)
         if callback:
             self.current_worker.finished.connect(callback)
         self.current_worker.start()
@@ -1807,50 +2745,47 @@ class GMRTGrabber(QWidget):
         self.log_message("Coordinates validated successfully")
         
         # Log the grid download request details
-        format_type = self.format_combo.currentText()
+        format_type_display = self.format_combo.currentText()
+        # Normalize format type for internal use
+        # Handle "NetCDF (COARDS)" -> "coards", "NetCDF" -> "netcdf", "GeoTIFF" -> "geotiff"
+        format_type_lower = format_type_display.lower()
+        if "coards" in format_type_lower:
+            format_type = "coards"
+        elif "netcdf" in format_type_lower:
+            format_type = "netcdf"
+        else:
+            format_type = format_type_lower
         layer_type_display = self.layer_combo.currentText()
         layer_type = self.get_layer_type()
         mres_value = self.mres_combo.currentText()
         
         self.log_message(f"Grid download request:")
-        self.log_message(f"  Format: {format_type}")
+        self.log_message(f"  Format: {format_type_display}")
         self.log_message(f"  Layer: {layer_type_display}")
         self.log_message(f"  Cell Resolution: {mres_value} meters/pixel")
-        
-        # Check for large grid warning
-        try:
-            if not self.check_large_grid_warning():
-                self.log_message("Download cancelled by user")
-                self.download_btn.setText("Download Grid")
-                self.download_btn.setEnabled(True)
-                self.status_label.setText("")
-                return
-        except Exception as e:
-            self.status_label.setText(f"Warning check error: {str(e)}")
-            self.download_btn.setText("Download Grid")
-            self.download_btn.setEnabled(True)
-            return
-
-        format_type = self.format_combo.currentText()
         layer_type = self.get_layer_type()
         
-        # Map format to file extension
+        # Map format to file extension (downloads are always GeoTIFF, but final format may differ)
         format_extensions = {
             "geotiff": ".tif",
-            "netcdf": ".nc", 
-            "esriascii": ".asc",
+            "netcdf": ".nc",
             "coards": ".grd"
         }
-        
-        file_ext = format_extensions.get(format_type, f".{format_type}")
+        file_ext = format_extensions.get(format_type, ".tif")
         current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         layer_type_display = self.layer_combo.currentText()
         self.log_message(f"Format: {format_type}, Layer: {layer_type_display}, Cell Resolution: {self.mres_combo.currentText()} meters/pixel")
         self.log_message("Parameters validated successfully")
 
-        if self.tile_checkbox.isChecked():
-            # Tiled download
+        # Automatically determine if tiling is needed based on 2-degree threshold
+        lon_span = abs(east - west)
+        lat_span = abs(north - south)
+        needs_tiling = (lat_span > 2.0) or (lon_span > 2.0)
+        
+        if needs_tiling:
+            self.log_message(f"Area exceeds 2-degree threshold (lat: {lat_span:.2f}°, lon: {lon_span:.2f}°), automatically tiling download")
+            # Tiled download - automatically mosaic and delete tiles
             # Overlap is now calculated automatically from cell resolution
             tiles = self.generate_tiles(west, east, south, north)
             self.log_message(f"Generated {len(tiles)} tiles")
@@ -1909,7 +2844,6 @@ class GMRTGrabber(QWidget):
                 "east": east,
                 "south": south,
                 "north": north,
-                "format": format_type,
                 "layer": layer_type,
                 "mresolution": float(self.mres_combo.currentText())
             }
@@ -1918,7 +2852,7 @@ class GMRTGrabber(QWidget):
             self.status_label.repaint()
             
             self.download_btn.setEnabled(False)  # Disable button during download
-            self.download_single_grid(params, file_name, self.on_single_download_finished)
+            self.download_single_grid(params, file_name, self.on_single_download_finished, format_type)
             
     def download_next_tile(self):
         """Download the next tile in the sequence"""
@@ -1929,7 +2863,10 @@ class GMRTGrabber(QWidget):
         # Use lower left coordinates instead of date/time
         ll_lon = f"{tile['west']:.3f}".replace('-', 'm').replace('.', 'p')
         ll_lat = f"{tile['south']:.3f}".replace('-', 'm').replace('.', 'p')
-        tile_filename = f"gmrt_{self.layer_type}_{ll_lon}_{ll_lat}_{self.current_tile_index + 1:03d}{self.file_ext}"
+        # Tiles always use .tif extension (they remain as GeoTIFF)
+        # Only the final mosaic will be converted to the output format
+        tile_ext = '.tif'
+        tile_filename = f"gmrt_{self.layer_type}_{ll_lon}_{ll_lat}_{self.current_tile_index + 1:03d}{tile_ext}"
         tile_path = os.path.join(self.download_dir, tile_filename)
         
         self.log_message(f"Starting download of tile {self.current_tile_index + 1}/{len(self.tiles_to_download)}: {tile_filename}")
@@ -1939,7 +2876,6 @@ class GMRTGrabber(QWidget):
             "east": tile['east'],
             "south": tile['south'],
             "north": tile['north'],
-            "format": self.format_type,
             "layer": self.layer_type,
             "mresolution": float(self.mres_combo.currentText())
         }
@@ -1947,20 +2883,140 @@ class GMRTGrabber(QWidget):
         self.status_label.setText(f"Downloading tile {self.current_tile_index + 1}/{len(self.tiles_to_download)}: {tile_filename}")
         self.status_label.repaint()
         
-        self.download_single_grid(params, tile_path, self.on_tile_download_finished)
+        self.download_single_grid(params, tile_path, self.on_tile_download_finished, self.format_type)
 
     def split_grid_file(self, filename, format_type):
         """
         Split a grid file into topography (>=0) and bathymetry (<0) files for supported formats.
         Appends _topo and _bathy to the base filename.
+        For NetCDF format, splits GeoTIFF first, then converts to NetCDF.
         """
         import os
         base, ext = os.path.splitext(filename)
-        topo_file = base + '_topo' + ext
-        bathy_file = base + '_bathy' + ext
+        
+        # Determine output extension based on format
+        if format_type == 'netcdf':
+            output_ext = '.nc'
+        elif format_type == 'esriascii':
+            output_ext = '.asc'
+        elif format_type == 'coards':
+            output_ext = '.grd'
+        else:
+            output_ext = ext  # Default to input extension (GeoTIFF)
+        
+        topo_file = base + '_topo' + output_ext
+        bathy_file = base + '_bathy' + output_ext
         try:
             deleted_files = []
-            if format_type == 'geotiff' and rasterio is not None:
+            
+            # For NetCDF and COARDS formats, we need to split as GeoTIFF first, then convert
+            if format_type == 'netcdf' and rasterio is not None:
+                # Split as GeoTIFF first
+                temp_topo_tif = base + '_topo_temp.tif'
+                temp_bathy_tif = base + '_bathy_temp.tif'
+                
+                with rasterio.open(filename) as src:
+                    data = src.read(1)
+                    profile = src.profile
+                    topo_data = np.where(data >= 0, data, np.nan)
+                    bathy_data = np.where(data < 0, data, np.nan)
+                    profile.update(dtype=rasterio.float32, nodata=np.nan)
+                    with rasterio.open(temp_topo_tif, 'w', **profile) as dst:
+                        dst.write(topo_data.astype(np.float32), 1)
+                    with rasterio.open(temp_bathy_tif, 'w', **profile) as dst:
+                        dst.write(bathy_data.astype(np.float32), 1)
+                
+                # Check if files are empty and convert to NetCDF
+                topo_data_check = np.where(np.isnan(topo_data), 0, topo_data)
+                bathy_data_check = np.where(np.isnan(bathy_data), 0, bathy_data)
+                
+                if not np.isnan(topo_data).all() and os.path.getsize(temp_topo_tif) > 0:
+                    if convert_geotiff_to_netcdf(temp_topo_tif, topo_file):
+                        self.log_message(f"Split topography to NetCDF: {os.path.basename(topo_file)}")
+                    else:
+                        self.log_message(f"Failed to convert topography to NetCDF")
+                else:
+                    try:
+                        os.remove(temp_topo_tif)
+                        deleted_files.append(temp_topo_tif)
+                        self.log_message(f"Deleted empty topography GeoTIFF")
+                    except:
+                        pass
+                
+                if not np.isnan(bathy_data).all() and os.path.getsize(temp_bathy_tif) > 0:
+                    if convert_geotiff_to_netcdf(temp_bathy_tif, bathy_file):
+                        self.log_message(f"Split bathymetry to NetCDF: {os.path.basename(bathy_file)}")
+                    else:
+                        self.log_message(f"Failed to convert bathymetry to NetCDF")
+                else:
+                    try:
+                        os.remove(temp_bathy_tif)
+                        deleted_files.append(temp_bathy_tif)
+                        self.log_message(f"Deleted empty bathymetry GeoTIFF")
+                    except:
+                        pass
+                
+                # Clean up temporary GeoTIFF files
+                for temp_file in [temp_topo_tif, temp_bathy_tif]:
+                    try:
+                        if os.path.exists(temp_file):
+                            os.remove(temp_file)
+                    except:
+                        pass
+            
+            # For COARDS format, split as GeoTIFF first, then convert to COARDS
+            elif format_type == 'coards' and rasterio is not None:
+                # Split as GeoTIFF first
+                temp_topo_tif = base + '_topo_temp.tif'
+                temp_bathy_tif = base + '_bathy_temp.tif'
+                
+                with rasterio.open(filename) as src:
+                    data = src.read(1)
+                    profile = src.profile
+                    topo_data = np.where(data >= 0, data, np.nan)
+                    bathy_data = np.where(data < 0, data, np.nan)
+                    profile.update(dtype=rasterio.float32, nodata=np.nan)
+                    with rasterio.open(temp_topo_tif, 'w', **profile) as dst:
+                        dst.write(topo_data.astype(np.float32), 1)
+                    with rasterio.open(temp_bathy_tif, 'w', **profile) as dst:
+                        dst.write(bathy_data.astype(np.float32), 1)
+                
+                # Check if files are empty and convert to COARDS
+                if not np.isnan(topo_data).all() and os.path.getsize(temp_topo_tif) > 0:
+                    if convert_geotiff_to_coards(temp_topo_tif, topo_file):
+                        self.log_message(f"Split topography to COARDS: {os.path.basename(topo_file)}")
+                    else:
+                        self.log_message(f"Failed to convert topography to COARDS")
+                else:
+                    try:
+                        os.remove(temp_topo_tif)
+                        deleted_files.append(temp_topo_tif)
+                        self.log_message(f"Deleted empty topography GeoTIFF")
+                    except:
+                        pass
+                
+                if not np.isnan(bathy_data).all() and os.path.getsize(temp_bathy_tif) > 0:
+                    if convert_geotiff_to_coards(temp_bathy_tif, bathy_file):
+                        self.log_message(f"Split bathymetry to COARDS: {os.path.basename(bathy_file)}")
+                    else:
+                        self.log_message(f"Failed to convert bathymetry to COARDS")
+                else:
+                    try:
+                        os.remove(temp_bathy_tif)
+                        deleted_files.append(temp_bathy_tif)
+                        self.log_message(f"Deleted empty bathymetry GeoTIFF")
+                    except:
+                        pass
+                
+                # Clean up temporary GeoTIFF files
+                for temp_file in [temp_topo_tif, temp_bathy_tif]:
+                    try:
+                        if os.path.exists(temp_file):
+                            os.remove(temp_file)
+                    except:
+                        pass
+                        
+            elif format_type == 'geotiff' and rasterio is not None:
                 with rasterio.open(filename) as src:
                     data = src.read(1)
                     profile = src.profile
@@ -1980,83 +3036,6 @@ class GMRTGrabber(QWidget):
                         except Exception as e:
                             self.log_message(f"Failed to delete empty {label} GeoTIFF: {os.path.basename(f)}: {e}")
                 self.log_message(f"Split GeoTIFF: {os.path.basename(topo_file)}, {os.path.basename(bathy_file)}")
-            elif format_type in ['esriascii', 'coards']:
-                with open(filename, 'r') as f:
-                    header = []
-                    data_lines = []
-                    for line in f:
-                        if any(x in line.lower() for x in ['ncols', 'nrows', 'xllcorner', 'yllcorner', 'cellsize', 'nodata_value']):
-                            header.append(line)
-                        else:
-                            data_lines.append(line)
-                data = np.genfromtxt(data_lines)
-                topo_data = np.where(data >= 0, data, np.nan)
-                bathy_data = np.where(data < 0, data, np.nan)
-                with open(topo_file, 'w') as f:
-                    for h in header:
-                        f.write(h)
-                    np.savetxt(f, topo_data, fmt='%.6f')
-                with open(bathy_file, 'w') as f:
-                    for h in header:
-                        f.write(h)
-                    np.savetxt(f, bathy_data, fmt='%.6f')
-                for f, arr, label in [(topo_file, topo_data, 'topo'), (bathy_file, bathy_data, 'bathy')]:
-                    if np.isnan(arr).all() or os.path.getsize(f) == 0:
-                        try:
-                            os.remove(f)
-                            deleted_files.append(f)
-                            self.log_message(f"Deleted empty {label} ASCII grid: {os.path.basename(f)}")
-                        except Exception as e:
-                            self.log_message(f"Failed to delete empty {label} ASCII grid: {os.path.basename(f)}: {e}")
-                self.log_message(f"Split ASCII grid: {os.path.basename(topo_file)}, {os.path.basename(bathy_file)}")
-            elif format_type == 'netcdf' and netCDF4 is not None:
-                ds = netCDF4.Dataset(filename, 'r')
-                data_var = None
-                for var in ds.variables:
-                    if ds.variables[var].ndim == 2:
-                        data_var = var
-                        break
-                if data_var is None:
-                    self.log_message("No 2D variable found in NetCDF file for splitting.")
-                    ds.close()
-                    return
-                data = ds.variables[data_var][:]
-                topo_data = np.where(data >= 0, data, np.nan)
-                bathy_data = np.where(data < 0, data, np.nan)
-                topo_ds = netCDF4.Dataset(topo_file, 'w')
-                for dim in ds.dimensions:
-                    topo_ds.createDimension(dim, len(ds.dimensions[dim]))
-                for var in ds.variables:
-                    if var != data_var:
-                        topo_ds.createVariable(var, ds.variables[var].datatype, ds.variables[var].dimensions)
-                        topo_ds.variables[var][:] = ds.variables[var][:]
-                topo_var = topo_ds.createVariable(data_var, 'f4', ds.variables[data_var].dimensions, fill_value=np.nan)
-                topo_var[:] = topo_data
-                topo_ds.close()
-                bathy_ds = netCDF4.Dataset(bathy_file, 'w')
-                for dim in ds.dimensions:
-                    bathy_ds.createDimension(dim, len(ds.dimensions[dim]))
-                for var in ds.variables:
-                    if var != data_var:
-                        bathy_ds.createVariable(var, ds.variables[var].datatype, ds.variables[var].dimensions)
-                        bathy_ds.variables[var][:] = ds.variables[var][:]
-                bathy_var = bathy_ds.createVariable(data_var, 'f4', ds.variables[data_var].dimensions, fill_value=np.nan)
-                bathy_var[:] = bathy_data
-                bathy_ds.close()
-                ds.close()
-                for f, arr, label in [(topo_file, topo_data, 'topo'), (bathy_file, bathy_data, 'bathy')]:
-                    try:
-                        with netCDF4.Dataset(f, 'r') as check_ds:
-                            check_var = check_ds.variables[data_var][:]
-                            if np.isnan(check_var).all() or os.path.getsize(f) == 0:
-                                os.remove(f)
-                                deleted_files.append(f)
-                                self.log_message(f"Deleted empty {label} NetCDF: {os.path.basename(f)}")
-                    except Exception as e:
-                        self.log_message(f"Failed to check/delete empty {label} NetCDF: {os.path.basename(f)}: {e}")
-                self.log_message(f"Split NetCDF: {os.path.basename(topo_file)}, {os.path.basename(bathy_file)}")
-            elif format_type == 'netcdf':
-                self.log_message("NetCDF4 not installed, cannot split NetCDF file.")
             else:
                 self.log_message(f"Split not supported for format: {format_type}")
             # After splitting and empty checks, delete the original if split is enabled
@@ -2076,10 +3055,90 @@ class GMRTGrabber(QWidget):
         if success:
             self.log_message(f"Download completed successfully: {os.path.basename(result)}")
             self.status_label.setText(f"Download complete: {result}")
-            # Split if requested
-            format_type = self.format_combo.currentText()
+            # Normalize format type for internal use
+            format_type_display = self.format_combo.currentText()
+            format_type_lower = format_type_display.lower()
+            if "coards" in format_type_lower:
+                format_type = "coards"
+            elif "netcdf" in format_type_lower:
+                format_type = "netcdf"
+            else:
+                format_type = format_type_lower
+            
+            # Split if requested (this handles conversion to NetCDF/COARDS if format is NetCDF/COARDS)
             if self.split_checkbox.isChecked():
                 self.split_grid_file(result, format_type)
+            # Convert to NetCDF if format is NetCDF and split is not enabled
+            elif format_type == 'netcdf':
+                base, ext = os.path.splitext(result)
+                # If filename already has .nc extension, use a temp file for conversion
+                if ext.lower() == '.nc':
+                    temp_tif = base + '_temp.tif'
+                    try:
+                        # Rename the downloaded file to .tif temporarily
+                        os.rename(result, temp_tif)
+                        netcdf_file = result  # Use original filename
+                        if convert_geotiff_to_netcdf(temp_tif, netcdf_file):
+                            self.log_message(f"Converted to NetCDF: {os.path.basename(netcdf_file)}")
+                            # Delete the temporary GeoTIFF file
+                            try:
+                                os.remove(temp_tif)
+                            except Exception as e:
+                                self.log_message(f"Failed to delete temporary GeoTIFF file: {e}")
+                            result = netcdf_file
+                        else:
+                            # Conversion failed, restore original file
+                            os.rename(temp_tif, result)
+                            self.log_message(f"Failed to convert to NetCDF, keeping GeoTIFF file")
+                    except Exception as e:
+                        self.log_message(f"Error during NetCDF conversion: {e}")
+                else:
+                    # Filename has .tif extension, convert normally
+                    netcdf_file = base + '.nc'
+                    if convert_geotiff_to_netcdf(result, netcdf_file):
+                        self.log_message(f"Converted to NetCDF: {os.path.basename(netcdf_file)}")
+                        # Delete the temporary GeoTIFF file
+                        try:
+                            os.remove(result)
+                            self.log_message(f"Deleted temporary GeoTIFF file")
+                        except Exception as e:
+                            self.log_message(f"Failed to delete temporary GeoTIFF file: {e}")
+                        result = netcdf_file  # Update result to point to NetCDF file
+                    else:
+                        self.log_message(f"Failed to convert to NetCDF, keeping GeoTIFF file")
+            # Convert to COARDS if format is COARDS and split is not enabled
+            elif format_type == 'coards':
+                base, ext = os.path.splitext(result)
+                # If filename already has .grd extension, use a temp file for conversion
+                if ext.lower() == '.grd':
+                    temp_tif = base + '_temp.tif'
+                    try:
+                        os.rename(result, temp_tif)
+                        coards_file = result
+                        if convert_geotiff_to_coards(temp_tif, coards_file):
+                            self.log_message(f"Converted to COARDS: {os.path.basename(coards_file)}")
+                            try:
+                                os.remove(temp_tif)
+                            except Exception as e:
+                                self.log_message(f"Failed to delete temporary GeoTIFF file: {e}")
+                            result = coards_file
+                        else:
+                            os.rename(temp_tif, result)
+                            self.log_message(f"Failed to convert to COARDS, keeping GeoTIFF file")
+                    except Exception as e:
+                        self.log_message(f"Error during COARDS conversion: {e}")
+                else:
+                    coards_file = base + '.grd'
+                    if convert_geotiff_to_coards(result, coards_file):
+                        self.log_message(f"Converted to COARDS: {os.path.basename(coards_file)}")
+                        try:
+                            os.remove(result)
+                            self.log_message(f"Deleted temporary GeoTIFF file")
+                        except Exception as e:
+                            self.log_message(f"Failed to delete temporary GeoTIFF file: {e}")
+                        result = coards_file
+                    else:
+                        self.log_message(f"Failed to convert to COARDS, keeping GeoTIFF file")
             QMessageBox.information(self, "Success", f"Grid downloaded to:\n{result}")
         else:
             self.log_message(f"Download failed: {result}")
@@ -2093,11 +3152,8 @@ class GMRTGrabber(QWidget):
                 self.success_count += 1
                 self.downloaded_tile_files.append(result)  # Track downloaded file
                 self.log_message(f"Tile {self.current_tile_index + 1} downloaded successfully: {os.path.basename(result)}")
-                # Don't split individual tiles if mosaicking is enabled
-                if not self.mosaic_checkbox.isChecked():
-                    format_type = self.format_type
-                    if self.split_checkbox.isChecked():
-                        self.split_grid_file(result, format_type)
+                # Tiles remain as GeoTIFF and only the final mosaic will be converted to the output format
+                # No need to convert individual tiles since they will be automatically mosaicked
             else:
                 self.log_message(f"Tile {self.current_tile_index + 1} failed: {result}")
             
@@ -2108,27 +3164,24 @@ class GMRTGrabber(QWidget):
             if self.current_tile_index < len(self.tiles_to_download):
                 self.log_message(f"Waiting 2 seconds before downloading tile {self.current_tile_index + 1}")
                 # Use QTimer.singleShot to ensure this runs on the main thread
-                from PyQt6.QtCore import QTimer
                 QTimer.singleShot(2000, self.download_next_tile)
             else:
-                # All tiles downloaded, check if mosaicking is enabled
+                # All tiles downloaded, automatically start mosaicking
                 self.log_message(f"All {len(self.tiles_to_download)} tiles completed. Success count: {self.success_count}")
                 self.log_message(f"Downloaded tile files: {self.downloaded_tile_files}")
                 
-                if self.mosaic_checkbox.isChecked() and self.downloaded_tile_files:
-                    self.log_message("All tiles downloaded, starting mosaicking process...")
+                if self.downloaded_tile_files:
+                    self.log_message("All tiles downloaded, automatically starting mosaicking process...")
                     # Use QTimer.singleShot to ensure this runs on the main thread
-                    from PyQt6.QtCore import QTimer
                     QTimer.singleShot(3000, self.start_mosaicking)
                 else:
-                    # No mosaicking, finish normally
+                    # No tiles downloaded, finish normally
                     QTimer.singleShot(100, self.finish_tile_download)
                     
         except Exception as e:
             import traceback
             self.log_message(f"ERROR in on_tile_download_finished: {str(e)}")
             self.log_message(f"Traceback: {traceback.format_exc()}")
-            from PyQt6.QtCore import QTimer
             QTimer.singleShot(100, self.finish_tile_download)
     
     def start_mosaicking(self):
@@ -2146,6 +3199,7 @@ class GMRTGrabber(QWidget):
             self.log_message("Using rasterio for mosaicking")
 
             # Create and start the mosaic worker thread
+            # Note: delete_tiles_checkbox is None since tiles are always deleted after mosaicking
             print(f"[DEBUG] Creating MosaicWorker with {len(self.downloaded_tile_files)} tiles")
             self.mosaic_worker = MosaicWorker(
                 self.downloaded_tile_files,
@@ -2155,7 +3209,7 @@ class GMRTGrabber(QWidget):
                 self.south_spin,
                 self.east_spin,
                 self.north_spin,
-                self.delete_tiles_checkbox,
+                None,  # delete_tiles_checkbox - always delete tiles after mosaicking
                 self.split_checkbox,
                 self.format_type
             )
@@ -2197,26 +3251,97 @@ class GMRTGrabber(QWidget):
                     mosaic_path = self.mosaic_worker.mosaic_path
                     print(f"[DEBUG] Mosaic file created: {mosaic_path}")
                     
-                    # Delete individual tile files if enabled
-                    if self.delete_tiles_checkbox.isChecked():
-                        deleted_count = 0
-                        for tile_file in self.downloaded_tile_files:
-                            try:
-                                if os.path.exists(tile_file):
-                                    os.remove(tile_file)
-                                    deleted_count += 1
-                                    print(f"[DEBUG] Deleted tile: {os.path.basename(tile_file)}")
-                            except Exception as e:
-                                print(f"[DEBUG] Error deleting tile {tile_file}: {str(e)}")
-                        
-                        print(f"[DEBUG] Deleted {deleted_count} individual tile files")
+                    # Always delete individual tile files after mosaicking
+                    deleted_count = 0
+                    for tile_file in self.downloaded_tile_files:
+                        try:
+                            if os.path.exists(tile_file):
+                                os.remove(tile_file)
+                                deleted_count += 1
+                                print(f"[DEBUG] Deleted tile: {os.path.basename(tile_file)}")
+                        except Exception as e:
+                            print(f"[DEBUG] Error deleting tile {tile_file}: {str(e)}")
+                    
+                    print(f"[DEBUG] Deleted {deleted_count} individual tile files")
+                    
+                    # Get format type
+                    format_type = self.format_type
                     
                     # Apply splitting to the mosaicked file if requested
                     if self.split_checkbox.isChecked():
                         print("[DEBUG] Applying split to mosaicked file...")
                         self.log_message("Applying split to mosaicked file...")
-                        self.split_grid_file(mosaic_path, 'geotiff')
-                    
+                        self.split_grid_file(mosaic_path, format_type)
+                    # Convert to NetCDF if format is NetCDF and split is not enabled
+                    elif format_type == 'netcdf':
+                        print("[DEBUG] Converting mosaicked file to NetCDF...")
+                        self.log_message("Converting mosaicked file to NetCDF...")
+                        base, ext = os.path.splitext(mosaic_path)
+                        # If filename already has .nc extension, use a temp file for conversion
+                        if ext.lower() == '.nc':
+                            temp_tif = base + '_temp.tif'
+                            try:
+                                os.rename(mosaic_path, temp_tif)
+                                netcdf_file = mosaic_path
+                                if convert_geotiff_to_netcdf(temp_tif, netcdf_file):
+                                    self.log_message(f"Converted mosaic to NetCDF: {os.path.basename(netcdf_file)}")
+                                    try:
+                                        os.remove(temp_tif)
+                                    except Exception as e:
+                                        self.log_message(f"Failed to delete temporary GeoTIFF mosaic: {e}")
+                                    mosaic_path = netcdf_file
+                                else:
+                                    os.rename(temp_tif, mosaic_path)
+                                    self.log_message(f"Failed to convert mosaic to NetCDF, keeping GeoTIFF file")
+                            except Exception as e:
+                                self.log_message(f"Error during mosaic NetCDF conversion: {e}")
+                        else:
+                            netcdf_file = base + '.nc'
+                            if convert_geotiff_to_netcdf(mosaic_path, netcdf_file):
+                                self.log_message(f"Converted mosaic to NetCDF: {os.path.basename(netcdf_file)}")
+                                try:
+                                    os.remove(mosaic_path)
+                                    self.log_message(f"Deleted temporary GeoTIFF mosaic file")
+                                except Exception as e:
+                                    self.log_message(f"Failed to delete temporary GeoTIFF mosaic: {e}")
+                                mosaic_path = netcdf_file
+                            else:
+                                self.log_message(f"Failed to convert mosaic to NetCDF, keeping GeoTIFF file")
+                    # Convert to COARDS if format is COARDS and split is not enabled
+                    elif format_type == 'coards':
+                        print("[DEBUG] Converting mosaicked file to COARDS...")
+                        self.log_message("Converting mosaicked file to COARDS...")
+                        base, ext = os.path.splitext(mosaic_path)
+                        # If filename already has .grd extension, use a temp file for conversion
+                        if ext.lower() == '.grd':
+                            temp_tif = base + '_temp.tif'
+                            try:
+                                os.rename(mosaic_path, temp_tif)
+                                coards_file = mosaic_path
+                                if convert_geotiff_to_coards(temp_tif, coards_file):
+                                    self.log_message(f"Converted mosaic to COARDS: {os.path.basename(coards_file)}")
+                                    try:
+                                        os.remove(temp_tif)
+                                    except Exception as e:
+                                        self.log_message(f"Failed to delete temporary GeoTIFF mosaic: {e}")
+                                    mosaic_path = coards_file
+                                else:
+                                    os.rename(temp_tif, mosaic_path)
+                                    self.log_message(f"Failed to convert mosaic to COARDS, keeping GeoTIFF file")
+                            except Exception as e:
+                                self.log_message(f"Error during mosaic COARDS conversion: {e}")
+                        else:
+                            coards_file = base + '.grd'
+                            if convert_geotiff_to_coards(mosaic_path, coards_file):
+                                self.log_message(f"Converted mosaic to COARDS: {os.path.basename(coards_file)}")
+                                try:
+                                    os.remove(mosaic_path)
+                                    self.log_message(f"Deleted temporary GeoTIFF mosaic file")
+                                except Exception as e:
+                                    self.log_message(f"Failed to delete temporary GeoTIFF mosaic: {e}")
+                                mosaic_path = coards_file
+                            else:
+                                self.log_message(f"Failed to convert mosaic to COARDS, keeping GeoTIFF file")
                     # Finish with success message
                     self.download_btn.setEnabled(True)
                     self.download_btn.setText("Download Grid")
@@ -2479,21 +3604,18 @@ class GMRTGrabber(QWidget):
                     print(f"[DEBUG] Error closing dataset: {e}")
                     pass  # Ignore errors when closing
             
-            # Delete individual tile files if enabled
-            if self.delete_tiles_checkbox.isChecked():
-                deleted_count = 0
-                for tile_file in self.downloaded_tile_files:
-                    try:
-                        if os.path.exists(tile_file):
-                            os.remove(tile_file)
-                            deleted_count += 1
-                            self.log_message(f"Deleted tile: {os.path.basename(tile_file)}")
-                    except Exception as e:
-                        self.log_message(f"Error deleting tile {tile_file}: {str(e)}")
-                
-                self.log_message(f"Deleted {deleted_count} individual tile files")
-            else:
-                self.log_message(f"Individual tile files preserved: {len(self.downloaded_tile_files)} tiles")
+            # Always delete individual tile files after mosaicking
+            deleted_count = 0
+            for tile_file in self.downloaded_tile_files:
+                try:
+                    if os.path.exists(tile_file):
+                        os.remove(tile_file)
+                        deleted_count += 1
+                        self.log_message(f"Deleted tile: {os.path.basename(tile_file)}")
+                except Exception as e:
+                    self.log_message(f"Error deleting tile {tile_file}: {str(e)}")
+            
+            self.log_message(f"Deleted {deleted_count} individual tile files")
             
             # Apply splitting to the mosaicked file if requested
             if self.split_checkbox.isChecked():
@@ -2543,7 +3665,6 @@ class GMRTGrabber(QWidget):
             "east": tile['east'],
             "south": tile['south'],
             "north": tile['north'],
-            "format": format_type,
             "layer": layer_type,
             "mresolution": float(self.mres_combo.currentText())
         }
@@ -2552,7 +3673,7 @@ class GMRTGrabber(QWidget):
         self.status_label.repaint()
         
         self.download_btn.setEnabled(False)  # Disable button during download
-        self.download_single_grid(params, file_name, self.on_single_download_finished)
+        self.download_single_grid(params, file_name, self.on_single_download_finished, format_type)
 
     def on_rectangle_selected(self, bounds):
         print(f"[DEBUG] on_rectangle_selected called with bounds: {bounds}")
