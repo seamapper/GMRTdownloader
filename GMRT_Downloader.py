@@ -27,7 +27,7 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QComboBox, QPushButton, 
     QVBoxLayout, QHBoxLayout, QFileDialog, QMessageBox, QDoubleSpinBox, 
-    QGroupBox, QFormLayout, QCheckBox, QTextEdit, QSplitter, QFrame
+    QGroupBox, QFormLayout, QCheckBox, QTextEdit, QSplitter, QFrame, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QUrl, QRect, QPoint
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QIcon
@@ -47,7 +47,8 @@ import math
 #__version__ = "2025.02"  # Updated to fix zoom issues   
 # __version__ = "2025.03"  # Fixed tiling section to avoid gaps   
 # __version__ = "2025.04"  # Made the tile size parameter work    
-__version__ = "2025.05"  # Cleaned up the UI   
+# __version__ = "2025.05"  # Cleaned up the UI   
+__version__ = "2025.06"  # Major change to the operation of the program, streamlined the download process by removing tiling options
 
 # GMRT API endpoints
 GMRT_URL = "https://www.gmrt.org/services/GridServer"  # For downloading bathymetry data
@@ -93,7 +94,6 @@ class MapWorker(QThread):
         interact with GUI elements. Instead, it emits signals to
         communicate results back to the main thread.
         """
-        print("[DEBUG] MapWorker.run: started")
         try:
             # Prepare parameters for GMRT ImageServer API
             params = {
@@ -105,14 +105,8 @@ class MapWorker(QThread):
                 "mask": "1" if self.mask else "0"  # Convert boolean to string
             }
             
-            # Log the image download request
-            param_str = ", ".join([f"{k}={v}" for k, v in params.items()])
-            print(f"[MapWorker] Downloading map image: {param_str}")
-            print(f"[DEBUG] MapWorker.run: sending request to {GMRT_IMAGE_URL}")
-            
             # Download the map image from GMRT ImageServer
             response = requests.get(GMRT_IMAGE_URL, params=params, timeout=30)
-            print(f"[DEBUG] MapWorker.run: response status {response.status_code}")
             
             if response.status_code == 200:
                 # Successfully downloaded image data
@@ -121,18 +115,14 @@ class MapWorker(QThread):
                 image.loadFromData(response.content)
                 pixmap = QPixmap.fromImage(image)
                 
-                print(f"[MapWorker] Map image downloaded successfully ({len(response.content)} bytes)")
-                
                 # Emit signal with the loaded pixmap
                 self.map_loaded.emit(pixmap)
             else:
                 # HTTP error occurred
-                print(f"[MapWorker] Failed to download map image: HTTP {response.status_code}")
                 self.map_error.emit(f"Failed to load map: HTTP {response.status_code}")
                 
         except Exception as e:
             # Network or other error occurred
-            print(f"[MapWorker] Map image download error: {str(e)}")
             self.map_error.emit(f"Map loading error: {str(e)}")
 
 class MosaicWorker(QThread):
@@ -172,15 +162,12 @@ class MosaicWorker(QThread):
             dataset = rasterio.open(tile_file)
             return dataset
         except Exception as e1:
-            print(f"[DEBUG] Failed to open {tile_file} with default driver: {e1}")
             # If it's a NetCDF file, try explicitly with NetCDF driver
             if tile_file.lower().endswith('.nc'):
                 try:
-                    print(f"[DEBUG] Trying NetCDF driver for {os.path.basename(tile_file)}")
                     dataset = rasterio.open(tile_file, driver='NetCDF')
                     return dataset
                 except Exception as e2:
-                    print(f"[DEBUG] Failed to open NetCDF file with NetCDF driver: {e2}")
                     # Try alternative NetCDF access patterns using GDAL virtual dataset syntax
                     # GMRT NetCDF files might need subdataset specification
                     gdal_patterns = [
@@ -193,9 +180,7 @@ class MosaicWorker(QThread):
                     
                     for gdal_path in gdal_patterns:
                         try:
-                            print(f"[DEBUG] Trying GDAL path: {gdal_path}")
                             dataset = rasterio.open(gdal_path)
-                            print(f"[DEBUG] Successfully opened with pattern: {gdal_path}")
                             
                             # Check if the dataset has valid geographic metadata
                             # If CRS is None or bounds are not geographic, we need to convert it
@@ -205,21 +190,16 @@ class MosaicWorker(QThread):
                                 needs_conversion = False
                                 
                                 if src_crs is None:
-                                    print(f"[DEBUG] Rasterio source has no CRS, will use netCDF4 fallback")
                                     needs_conversion = True
                                 elif not src_crs.is_geographic:
-                                    print(f"[DEBUG] Rasterio source CRS is projected ({src_crs}), will use netCDF4 fallback")
                                     needs_conversion = True
                                 elif src_crs.to_epsg() != 4326:
-                                    print(f"[DEBUG] Rasterio source CRS is not EPSG:4326 ({src_crs}), will use netCDF4 fallback")
                                     needs_conversion = True
                                 elif (src_bounds[0] < -200 or src_bounds[2] > 200 or
                                       src_bounds[1] < -100 or src_bounds[3] > 100):
-                                    print(f"[DEBUG] Rasterio source has bad bounds: {src_bounds}, will use netCDF4 fallback")
                                     needs_conversion = True
                                 
                                 if needs_conversion:
-                                    print(f"[DEBUG] Closing rasterio source and falling back to netCDF4 approach")
                                     dataset.close()
                                     # Fall through to netCDF4 conversion
                                     break
@@ -227,22 +207,18 @@ class MosaicWorker(QThread):
                                     # Dataset is good, return it
                                     return dataset
                             except Exception as check_error:
-                                print(f"[DEBUG] Error checking dataset metadata: {check_error}, will use netCDF4 fallback")
                                 dataset.close()
                                 break
                         except Exception as e3:
-                            print(f"[DEBUG] Failed with pattern {gdal_path}: {e3}")
                             continue
                     
                     # If all GDAL patterns fail or produce invalid metadata, try using netCDF4 to read and create a temporary GeoTIFF
                     if netCDF4 is not None:
                         try:
-                            print(f"[DEBUG] Attempting NetCDF4-based conversion for {os.path.basename(tile_file)}")
                             return self._open_netcdf_with_netcdf4(tile_file)
                         except Exception as e4:
-                            print(f"[DEBUG] NetCDF4 conversion also failed: {e4}")
+                            pass
                     
-                    print(f"[DEBUG] All NetCDF open attempts failed for {tile_file}")
                     return None
             return None
     
@@ -266,7 +242,6 @@ class MosaicWorker(QThread):
         # Check if this is GMRT's special 1D array format
         # GMRT NetCDF files have: z (1D array), dimension (grid size), x_range, y_range, spacing
         if 'z' in nc.variables and 'dimension' in nc.variables and 'x_range' in nc.variables and 'y_range' in nc.variables:
-            print(f"[DEBUG] Detected GMRT 1D array format in _open_netcdf_with_netcdf4")
             try:
                 # Get grid dimensions
                 dimension = nc.variables['dimension'][:]
@@ -277,8 +252,6 @@ class MosaicWorker(QThread):
                     nc.close()
                     raise Exception(f"Invalid dimension array: {dimension}")
                 
-                print(f"[DEBUG] Grid dimensions: {ncols} x {nrows}")
-                
                 # Get coordinate ranges
                 x_range = nc.variables['x_range'][:]
                 y_range = nc.variables['y_range'][:]
@@ -287,16 +260,12 @@ class MosaicWorker(QThread):
                 lat_min = float(y_range[0])
                 lat_max = float(y_range[1])
                 
-                print(f"[DEBUG] Coordinate ranges: lon={lon_min:.6f} to {lon_max:.6f}, lat={lat_min:.6f} to {lat_max:.6f}")
-                
                 # Get the 1D data array
                 z_data = nc.variables['z'][:]
-                print(f"[DEBUG] Z data shape: {z_data.shape}, expected size: {nrows * ncols}")
                 
                 # Reshape to 2D (row-major, C order)
                 if z_data.size == nrows * ncols:
                     data = z_data.reshape((nrows, ncols), order='C')
-                    print(f"[DEBUG] Reshaped data to 2D: {data.shape}")
                 else:
                     nc.close()
                     raise Exception(f"Data size mismatch: got {z_data.size}, expected {nrows * ncols}")
@@ -305,7 +274,6 @@ class MosaicWorker(QThread):
                 from rasterio.transform import from_bounds
                 from rasterio.crs import CRS
                 transform = from_bounds(lon_min, lat_min, lon_max, lat_max, ncols, nrows)
-                print(f"[DEBUG] Transform: {transform}")
                 
                 # Use EPSG:4326 for GMRT data
                 crs = CRS.from_epsg(4326)
@@ -455,40 +423,31 @@ class MosaicWorker(QThread):
     
     def run(self):
         try:
-            print("[DEBUG] MosaicWorker.run() started")
             self.progress.emit("Starting mosaicking process...")
             
             if not self.downloaded_tile_files:
-                print("[DEBUG] No tiles to mosaic")
                 self.finished.emit(False, "No tiles to mosaic")
                 return
             
-            print(f"[DEBUG] Mosaicking {len(self.downloaded_tile_files)} tiles...")
             self.progress.emit(f"Mosaicking {len(self.downloaded_tile_files)} tiles...")
             
             # Check if all tile files exist and are readable
-            print("[DEBUG] Checking tile files...")
             missing_files = []
             for f in self.downloaded_tile_files:
                 if not os.path.exists(f):
-                    print(f"[DEBUG] Missing file: {f}")
                     missing_files.append(f)
                 else:
                     try:
                         with open(f, 'rb') as test_file:
                             test_file.read(1)
-                        print(f"[DEBUG] File readable: {os.path.basename(f)}")
                     except Exception as e:
-                        print(f"[DEBUG] File not readable: {f} - {e}")
                         missing_files.append(f)
             
             if missing_files:
-                print(f"[DEBUG] Missing files: {missing_files}")
                 self.finished.emit(False, f"Missing or unreadable tile files: {missing_files}")
                 return
             
             if rasterio is None:
-                print("[DEBUG] rasterio not available")
                 self.finished.emit(False, "rasterio not available for mosaicking")
                 return
             
@@ -496,11 +455,9 @@ class MosaicWorker(QThread):
             current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
             mosaic_filename = f"gmrt_{self.layer_type}_mosaic_{current_time}.tif"
             self.mosaic_path = os.path.join(self.download_dir, mosaic_filename)
-            print(f"[DEBUG] Output mosaic path: {self.mosaic_path}")
             self.progress.emit(f"Output mosaic path: {self.mosaic_path}")
             
             # Read all tile files and get their bounds
-            print("[DEBUG] Opening tile files with rasterio...")
             datasets = []
             bounds_list = []
             cell_sizes = []
@@ -509,10 +466,8 @@ class MosaicWorker(QThread):
             for i, tile_file in enumerate(self.downloaded_tile_files):
                 if os.path.exists(tile_file):
                     try:
-                        print(f"[DEBUG] Opening tile {i+1}/{len(self.downloaded_tile_files)}: {os.path.basename(tile_file)}")
                         dataset = self._open_raster_file(tile_file)
                         if dataset is None:
-                            print(f"[DEBUG] Failed to open tile {tile_file}")
                             continue
                         datasets.append(dataset)
                         bounds_list.append(dataset.bounds)
@@ -522,55 +477,39 @@ class MosaicWorker(QThread):
                         cell_size_x = abs(transform[0])
                         cell_size_y = abs(transform[4])
                         cell_sizes.append((cell_size_x, cell_size_y))
-                        print(f"[DEBUG] Successfully loaded tile: {os.path.basename(tile_file)} (cell size: {cell_size_x:.2f}m x {cell_size_y:.2f}m)")
                         
                     except Exception as e:
-                        print(f"[DEBUG] Error reading tile {tile_file}: {str(e)}")
-                        import traceback
-                        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
                         continue
             
             if not datasets:
-                print("[DEBUG] No valid tiles found for mosaicking")
                 self.finished.emit(False, "No valid tiles found for mosaicking")
                 return
             
             # Use rasterio for mosaicking
-            print("[DEBUG] Using rasterio for mosaicking")
             self.progress.emit("Using rasterio for mosaicking...")
             
             fallback_datasets = []
             try:
                 # Reopen datasets for rasterio fallback
-                print("[DEBUG] Reopening datasets for rasterio fallback...")
                 for tile_file in self.downloaded_tile_files:
                     if os.path.exists(tile_file):
                         try:
                             dataset = self._open_raster_file(tile_file)
                             if dataset is None:
-                                print(f"[DEBUG] Failed to reopen tile {tile_file}")
                                 continue
                             fallback_datasets.append(dataset)
-                            print(f"[DEBUG] Reopened tile: {os.path.basename(tile_file)}")
                         except Exception as e:
-                            print(f"[DEBUG] Error reopening tile {tile_file}: {str(e)}")
-                            import traceback
-                            print(f"[DEBUG] Traceback: {traceback.format_exc()}")
                             continue
                 
                 if fallback_datasets:
-                    print(f"[DEBUG] Using {len(fallback_datasets)} datasets for rasterio fallback")
                     original_bounds = (self.west_spin.value(), self.south_spin.value(), 
                                      self.east_spin.value(), self.north_spin.value())
                     self._mosaic_with_rasterio_fallback(fallback_datasets, self.mosaic_path, original_bounds)
-                    print("[DEBUG] Rasterio fallback completed successfully")
                     self.finished.emit(True, "Rasterio mosaicking completed successfully")
                 else:
-                    print("[DEBUG] No valid tiles found for fallback")
                     self.finished.emit(False, "No valid tiles found for fallback")
                     
             except Exception as fallback_error:
-                print(f"[DEBUG] Rasterio fallback failed: {str(fallback_error)}")
                 self.finished.emit(False, f"Rasterio fallback also failed: {str(fallback_error)}")
             finally:
                 # Clean up fallback_datasets if they weren't handled by _mosaic_with_rasterio_fallback
@@ -584,7 +523,6 @@ class MosaicWorker(QThread):
                         if temp_file and os.path.exists(temp_file):
                             try:
                                 os.remove(temp_file)
-                                print(f"[DEBUG] Cleaned up temporary file: {temp_file}")
                             except:
                                 pass
                     except:
@@ -592,13 +530,10 @@ class MosaicWorker(QThread):
             
         except Exception as e:
             import traceback
-            print(f"[DEBUG] CRITICAL ERROR in MosaicWorker: {str(e)}")
-            print(f"[DEBUG] Traceback: {traceback.format_exc()}")
             self.finished.emit(False, f"Mosaic worker error: {str(e)}\n{traceback.format_exc()}")
     
     def _mosaic_with_rasterio_fallback(self, datasets, mosaic_path, original_bounds):
         """Improved rasterio mosaicking with proper cell size handling"""
-        print("[DEBUG] Starting improved rasterio mosaicking...")
         import rasterio
         from rasterio.warp import calculate_default_transform, reproject, Resampling
         from rasterio.windows import from_bounds
@@ -610,7 +545,6 @@ class MosaicWorker(QThread):
                 raise Exception("No valid datasets provided for rasterio fallback")
             
             # Analyze all datasets to determine the finest resolution
-            print("[DEBUG] Analyzing tile resolutions...")
             cell_sizes = []
             bounds_list = []
             
@@ -618,11 +552,6 @@ class MosaicWorker(QThread):
                 transform = dataset.transform
                 bounds = dataset.bounds
                 crs = dataset.crs
-                print(f"[DEBUG] Tile {i+1} transform: {transform}")
-                print(f"[DEBUG] Tile {i+1} bounds: {bounds}")
-                print(f"[DEBUG] Tile {i+1} CRS: {crs}")
-                print(f"[DEBUG] Tile {i+1} CRS is geographic: {crs.is_geographic if crs else 'None'}")
-                print(f"[DEBUG] Tile {i+1} size: {dataset.width} x {dataset.height}")
                 
                 # INVESTIGATE CELL REGISTRATION: Check if bounds represent pixel centers or edges
                 if i == 0:  # Only check first tile for registration type
@@ -636,11 +565,6 @@ class MosaicWorker(QThread):
                     cell_size_x = abs(transform[0])
                     cell_size_y = abs(transform[4])
                     
-                    print(f"[DEBUG] === CELL REGISTRATION INVESTIGATION ===")
-                    print(f"[DEBUG] Tile bounds (from dataset.bounds): west={bounds[0]:.9f}, east={bounds[2]:.9f}, south={bounds[1]:.9f}, north={bounds[3]:.9f}")
-                    print(f"[DEBUG] First pixel center (from transform): lon={first_pixel_center_lon:.9f}, lat={first_pixel_center_lat:.9f}")
-                    print(f"[DEBUG] Last pixel center (from transform): lon={last_pixel_center_lon:.9f}, lat={last_pixel_center_lat:.9f}")
-                    print(f"[DEBUG] Cell size: {cell_size_x:.9f} x {cell_size_y:.9f} degrees")
                     
                     # Check if bounds represent pixel edges or centers
                     # If pixel-edge registration: first_pixel_center = bounds[0] + cell_size_x/2
@@ -653,25 +577,19 @@ class MosaicWorker(QThread):
                     lon_diff_center = abs(first_pixel_center_lon - bounds[0])
                     lat_diff_center = abs(first_pixel_center_lat - bounds[3])
                     
-                    print(f"[DEBUG] If EDGE registration: first pixel center should be at lon={expected_edge_registration_lon:.9f}, lat={expected_edge_registration_lat:.9f}")
-                    print(f"[DEBUG] Difference from edge registration: lon={lon_diff_edge:.9f}, lat={lat_diff_edge:.9f}")
-                    print(f"[DEBUG] Difference from center registration: lon={lon_diff_center:.9f}, lat={lat_diff_center:.9f}")
                     
                     if lon_diff_edge < 1e-6 and lat_diff_edge < 1e-6:
-                        print(f"[DEBUG] >>> TILE USES PIXEL-EDGE REGISTRATION (bounds = pixel edges) <<<")
+                        pass
                     elif lon_diff_center < 1e-6 and lat_diff_center < 1e-6:
-                        print(f"[DEBUG] >>> TILE USES PIXEL-CENTER REGISTRATION (bounds = pixel centers) <<<")
+                        pass
                     else:
-                        print(f"[DEBUG] >>> WARNING: Registration type unclear! Differences don't match either pattern <<<")
-                    print(f"[DEBUG] ==========================================")
+                        pass
                 
                 # Validate bounds are reasonable for geographic CRS
                 if crs and crs.is_geographic:
                     # Geographic bounds should be in degrees: lon -180 to 180, lat -90 to 90
                     if bounds[0] < -200 or bounds[2] > 200 or bounds[1] < -100 or bounds[3] > 100:
-                        print(f"[DEBUG] WARNING: Tile {i+1} bounds look like they might be in wrong units!")
-                        print(f"[DEBUG] Expected degrees (lon: -180 to 180, lat: -90 to 90)")
-                        print(f"[DEBUG] Got: lon {bounds[0]:.2f} to {bounds[2]:.2f}, lat {bounds[1]:.2f} to {bounds[3]:.2f}")
+                        pass
                 
                 # Get cell size from transform (units depend on CRS - degrees for geographic, meters for projected)
                 # Note: transform[4] is typically negative for geographic CRS (y-axis points down in image space)
@@ -684,30 +602,24 @@ class MosaicWorker(QThread):
                     if bounds[2] > bounds[0] and bounds[3] > bounds[1] and dataset.width > 0 and dataset.height > 0:
                         cell_size_x = (bounds[2] - bounds[0]) / dataset.width
                         cell_size_y = abs((bounds[3] - bounds[1]) / dataset.height)
-                        print(f"[DEBUG] Tile {i+1} using fallback cell size calculation")
                 
                 # Calculate cell size from actual dimensions and bounds for validation
                 if bounds[2] > bounds[0] and bounds[3] > bounds[1] and dataset.width > 0 and dataset.height > 0:
                     calc_cell_x = (bounds[2] - bounds[0]) / dataset.width
                     calc_cell_y = (bounds[3] - bounds[1]) / dataset.height
-                    print(f"[DEBUG] Tile {i+1} calculated cell size from bounds: {calc_cell_x:.9f} x {calc_cell_y:.9f}")
                 
                 cell_sizes.append((cell_size_x, cell_size_y))
                 bounds_list.append(bounds)
-                print(f"[DEBUG] Tile {i+1}: transform cell size {cell_size_x:.9f} x {cell_size_y:.9f}")
-                print(f"[DEBUG] === TILE {i+1} CELL SIZE: {cell_size_x:.9f}° x {cell_size_y:.9f}° (lon x lat) ===")
             
             # Find the finest resolution (smallest cell size)
             min_cell_x = min(cell_size[0] for cell_size in cell_sizes)
             min_cell_y = min(cell_size[1] for cell_size in cell_sizes)
-            print(f"[DEBUG] Finest resolution: {min_cell_x:.9f} x {min_cell_y:.9f}")
             
             # Calculate union of tile bounds
             tile_min_x = min(bounds[0] for bounds in bounds_list)
             tile_min_y = min(bounds[1] for bounds in bounds_list)
             tile_max_x = max(bounds[2] for bounds in bounds_list)
             tile_max_y = max(bounds[3] for bounds in bounds_list)
-            print(f"[DEBUG] Tile union bounds: min_x={tile_min_x:.6f}, max_x={tile_max_x:.6f}, min_y={tile_min_y:.6f}, max_y={tile_max_y:.6f}")
             
             # Get the first tile's transform to understand the grid alignment
             # We need to align the output transform to the same grid as the tiles
@@ -715,12 +627,9 @@ class MosaicWorker(QThread):
             from rasterio.transform import xy
             first_tile_first_pixel_lon, first_tile_first_pixel_lat = xy(first_tile_transform, 0, 0)
             
-            print(f"[DEBUG] First tile's first pixel center: lon={first_tile_first_pixel_lon:.9f}, lat={first_tile_first_pixel_lat:.9f}")
             
             # Use original requested bounds for the output extent
             min_x, min_y, max_x, max_y = original_bounds
-            print(f"[DEBUG] Using original requested bounds: min_x={min_x:.6f}, max_x={max_x:.6f}, min_y={min_y:.6f}, max_y={max_y:.6f}")
-            print(f"[DEBUG] Bounds span: x={max_x - min_x:.6f}, y={max_y - min_y:.6f}")
             
             # Validate bounds
             if max_x <= min_x or max_y <= min_y:
@@ -735,14 +644,12 @@ class MosaicWorker(QThread):
             width = int((max_x - min_x) / min_cell_x)
             height = int((max_y - min_y) / min_cell_y)
             
-            print(f"[DEBUG] Calculated output dimensions: {width} x {height} pixels")
             
             # Validate dimensions
             if width <= 0 or height <= 0:
                 raise Exception(f"Invalid dimensions calculated: width={width}, height={height}. "
                               f"This may indicate a units mismatch between bounds and cell size.")
             
-            print(f"[DEBUG] Validated output dimensions: {width} x {height} pixels")
             
             # ALIGN OUTPUT TRANSFORM TO TILE GRID
             # Instead of using from_bounds which creates a transform aligned to the bounds,
@@ -766,11 +673,6 @@ class MosaicWorker(QThread):
             aligned_east = aligned_west + width * min_cell_x
             aligned_south = aligned_north - height * min_cell_y
             
-            print(f"[DEBUG] === OUTPUT TRANSFORM ALIGNMENT ===")
-            print(f"[DEBUG] Requested bounds: west={min_x:.9f}, east={max_x:.9f}, south={min_y:.9f}, north={max_y:.9f}")
-            print(f"[DEBUG] Aligned bounds: west={aligned_west:.9f}, east={aligned_east:.9f}, south={aligned_south:.9f}, north={aligned_north:.9f}")
-            print(f"[DEBUG] Alignment offset: lon={aligned_west - min_x:.9f}, lat={aligned_north - max_y:.9f}")
-            print(f"[DEBUG] ===================================")
             
             # Create the output transform using aligned bounds (aligned to tile grid)
             output_transform = rasterio.transform.from_bounds(aligned_west, aligned_south, aligned_east, aligned_north, width, height)
@@ -780,11 +682,6 @@ class MosaicWorker(QThread):
             output_first_pixel_center_lon, output_first_pixel_center_lat = xy(output_transform, 0, 0)
             output_last_pixel_center_lon, output_last_pixel_center_lat = xy(output_transform, height - 1, width - 1)
             
-            print(f"[DEBUG] === OUTPUT TRANSFORM REGISTRATION INVESTIGATION ===")
-            print(f"[DEBUG] Output bounds (from from_bounds): west={min_x:.9f}, east={max_x:.9f}, south={min_y:.9f}, north={max_y:.9f}")
-            print(f"[DEBUG] Output first pixel center (from transform): lon={output_first_pixel_center_lon:.9f}, lat={output_first_pixel_center_lat:.9f}")
-            print(f"[DEBUG] Output last pixel center (from transform): lon={output_last_pixel_center_lon:.9f}, lat={output_last_pixel_center_lat:.9f}")
-            print(f"[DEBUG] Output cell size: {min_cell_x:.9f} x {min_cell_y:.9f} degrees")
             
             # from_bounds creates edge-registered transform
             expected_output_edge_lon = min_x + min_cell_x / 2.0
@@ -793,21 +690,16 @@ class MosaicWorker(QThread):
             output_lon_diff = abs(output_first_pixel_center_lon - expected_output_edge_lon)
             output_lat_diff = abs(output_first_pixel_center_lat - expected_output_edge_lat)
             
-            print(f"[DEBUG] Expected first pixel center (edge registration): lon={expected_output_edge_lon:.9f}, lat={expected_output_edge_lat:.9f}")
-            print(f"[DEBUG] Difference: lon={output_lon_diff:.9f}, lat={output_lat_diff:.9f}")
             if output_lon_diff < 1e-6 and output_lat_diff < 1e-6:
-                print(f"[DEBUG] >>> OUTPUT USES PIXEL-EDGE REGISTRATION (as expected from from_bounds) <<<")
+                pass
             else:
-                print(f"[DEBUG] >>> WARNING: Output transform doesn't match expected edge registration! <<<")
-            print(f"[DEBUG] =====================================================")
+                pass
             
             # Initialize the output array with nodata values
             output_array = np.full((height, width), -99999, dtype=np.float32)
             
             # Process each dataset using rasterio.warp.reproject for proper alignment
-            print("[DEBUG] Processing tiles with rasterio.warp.reproject for proper alignment...")
             for i, dataset in enumerate(datasets):
-                print(f"[DEBUG] Processing tile {i+1}/{len(datasets)}...")
                 
                 # Read the data
                 data = dataset.read(1)  # Read first band
@@ -823,9 +715,6 @@ class MosaicWorker(QThread):
                 src_crs = dataset.crs
                 src_bounds = dataset.bounds
                 
-                print(f"[DEBUG] Tile {i+1} bounds: {src_bounds}")
-                print(f"[DEBUG] Tile {i+1} data shape: {data.shape}")
-                print(f"[DEBUG] Tile {i+1} transform: {src_transform}")
                 
                 # Use rasterio.warp.reproject to properly align and resample the tile
                 # This handles all coordinate transformations correctly
@@ -859,12 +748,10 @@ class MosaicWorker(QThread):
                     output_array[update_mask] = tile_output[update_mask]
                     
                     valid_count = np.sum(valid_mask)
-                    print(f"[DEBUG] Tile {i+1}: Updated {valid_count} valid pixels")
                 else:
-                    print(f"[DEBUG] Tile {i+1}: No valid data to merge")
+                    pass
             
             # Final data validation
-            print("[DEBUG] Performing final data validation...")
             output_array = self.validate_bathymetry_data(output_array)
             
             # No need to crop since we already used original_bounds for the output transform
@@ -885,25 +772,19 @@ class MosaicWorker(QThread):
             }
             
             # Write the mosaic
-            print(f"[DEBUG] Writing mosaic to: {mosaic_path}")
             with rasterio.open(mosaic_path, 'w', **profile) as dst:
                 dst.write(output_array, 1)
             
             # Log final statistics
             valid_pixels = np.sum(output_array != -99999)
             total_pixels = output_array.size
-            print(f"[DEBUG] Mosaic completed: {valid_pixels}/{total_pixels} valid pixels")
-            print(f"[DEBUG] Data range: {np.nanmin(output_array[output_array != -99999]):.2f} to {np.nanmax(output_array[output_array != -99999]):.2f}")
             
             # Log final mosaic cell size
             final_cell_x = abs(output_transform[0])
             final_cell_y = abs(output_transform[4])
-            print(f"[DEBUG] Final mosaic cell size: {final_cell_x:.6f}m x {final_cell_y:.6f}m")
             
         except Exception as e:
-            print(f"[DEBUG] Rasterio fallback failed: {str(e)}")
             import traceback
-            print(f"[DEBUG] Traceback: {traceback.format_exc()}")
             raise
         finally:
             # Close all datasets and clean up temporary files
@@ -918,11 +799,9 @@ class MosaicWorker(QThread):
                     if temp_file and os.path.exists(temp_file):
                         try:
                             os.remove(temp_file)
-                            print(f"[DEBUG] Cleaned up temporary file: {temp_file}")
                         except Exception as e:
-                            print(f"[DEBUG] Could not delete temporary file {temp_file}: {e}")
+                            pass
                 except Exception as e:
-                    print(f"[DEBUG] Error closing dataset: {e}")
                     pass
 
     def validate_bathymetry_data(self, data):
@@ -965,9 +844,9 @@ class MosaicWorker(QThread):
         invalid_count = new_nodata - original_nodata
         
         if invalid_count > 0:
-            print(f"[DEBUG] Set {invalid_count} unrealistic values to nodata (-99999) (outside {min_elevation}m to {max_elevation}m range)")
+            pass
         else:
-            print("[DEBUG] All bathymetry/topography values are within realistic range")
+            pass
         
         return validated_data
 
@@ -993,18 +872,14 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
         # Approach 1: Try opening directly
         try:
             src = rasterio.open(netcdf_path)
-            print(f"[DEBUG] Successfully opened NetCDF with direct rasterio.open")
         except Exception as e1:
-            print(f"[DEBUG] Direct rasterio.open failed: {e1}")
             pass
         
         # Approach 2: Try with NETCDF driver
         if src is None:
             try:
                 src = rasterio.open(netcdf_path, driver='NETCDF')
-                print(f"[DEBUG] Successfully opened NetCDF with NETCDF driver")
             except Exception as e2:
-                print(f"[DEBUG] NETCDF driver failed: {e2}")
                 pass
         
         # Approach 3: Try with GDAL virtual dataset patterns
@@ -1019,10 +894,8 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
             for pattern in gdal_patterns:
                 try:
                     src = rasterio.open(pattern)
-                    print(f"[DEBUG] Successfully opened NetCDF with pattern: {pattern}")
                     break
                 except Exception as e3:
-                    print(f"[DEBUG] Pattern {pattern} failed: {e3}")
                     continue
         
         # Check if rasterio source has valid bounds/CRS before using it
@@ -1033,25 +906,19 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
                 # Check if we need to fallback due to bad bounds/CRS
                 needs_fallback = False
                 if src_crs is None:
-                    print(f"[DEBUG] Rasterio source has no CRS, will use netCDF4 fallback")
                     needs_fallback = True
                 elif not src_crs.is_geographic:
-                    print(f"[DEBUG] Rasterio source CRS is projected ({src_crs}), will use netCDF4 fallback")
                     needs_fallback = True
                 elif src_crs.to_epsg() != 4326:
-                    print(f"[DEBUG] Rasterio source CRS is not EPSG:4326 ({src_crs}), will use netCDF4 fallback")
                     needs_fallback = True
                 elif (src_bounds[0] < -200 or src_bounds[2] > 200 or 
                       src_bounds[1] < -100 or src_bounds[3] > 100):
-                    print(f"[DEBUG] Rasterio source has bad bounds: {src_bounds}, will use netCDF4 fallback")
                     needs_fallback = True
                 
                 if needs_fallback:
-                    print(f"[DEBUG] Closing rasterio source and falling back to netCDF4 approach")
                     src.close()
                     src = None
             except Exception as e:
-                print(f"[DEBUG] Error checking rasterio source bounds/CRS: {e}, will use netCDF4 fallback")
                 # If we can't check, close and fallback
                 if src:
                     src.close()
@@ -1060,17 +927,13 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
         # Approach 4: Try with netCDF4 library and convert directly to GeoTIFF
         if src is None and netCDF4 is not None:
             try:
-                print(f"[DEBUG] Attempting netCDF4-based conversion")
                 # Open with netCDF4 and find the data variable
                 with netCDF4.Dataset(netcdf_path, 'r') as nc:
                     # Debug: Print all variables
-                    print(f"[DEBUG] NetCDF variables: {list(nc.variables.keys())}")
-                    print(f"[DEBUG] NetCDF dimensions: {list(nc.dimensions.keys())}")
                     
                     # Check if this is GMRT's special 1D array format
                     # GMRT NetCDF files have: z (1D array), dimension (grid size), x_range, y_range, spacing
                     if 'z' in nc.variables and 'dimension' in nc.variables and 'x_range' in nc.variables and 'y_range' in nc.variables:
-                        print(f"[DEBUG] Detected GMRT 1D array format")
                         try:
                             # Get grid dimensions
                             dimension = nc.variables['dimension'][:]
@@ -1078,10 +941,8 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
                                 ncols = int(dimension[0])
                                 nrows = int(dimension[1])
                             else:
-                                print(f"[DEBUG] Invalid dimension array: {dimension}")
                                 return False
                             
-                            print(f"[DEBUG] Grid dimensions: {ncols} x {nrows}")
                             
                             # Get coordinate ranges
                             x_range = nc.variables['x_range'][:]
@@ -1091,26 +952,21 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
                             lat_min = float(y_range[0])
                             lat_max = float(y_range[1])
                             
-                            print(f"[DEBUG] Coordinate ranges: lon={lon_min:.6f} to {lon_max:.6f}, lat={lat_min:.6f} to {lat_max:.6f}")
                             
                             # Get the 1D data array
                             z_data = nc.variables['z'][:]
-                            print(f"[DEBUG] Z data shape: {z_data.shape}, expected size: {nrows * ncols}")
                             
                             # Reshape to 2D (note: GMRT may store row-major or column-major)
                             # Try both orientations
                             if z_data.size == nrows * ncols:
                                 # Reshape to 2D - try row-major first (C order)
                                 data = z_data.reshape((nrows, ncols), order='C')
-                                print(f"[DEBUG] Reshaped data to 2D: {data.shape}")
                             else:
-                                print(f"[DEBUG] Data size mismatch: got {z_data.size}, expected {nrows * ncols}")
                                 return False
                             
                             # Create transform
                             from rasterio.transform import from_bounds
                             transform = from_bounds(lon_min, lat_min, lon_max, lat_max, ncols, nrows)
-                            print(f"[DEBUG] Transform: {transform}")
                             
                             # Only use tiled format if dimensions are compatible
                             use_tiled = (nrows % 16 == 0) and (ncols % 16 == 0)
@@ -1145,16 +1001,12 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
                                 profile['nodata'] = -99999
                             
                             # Write to GeoTIFF
-                            print(f"[DEBUG] Writing GeoTIFF to: {output_path}")
                             with rasterio.open(output_path, 'w', **profile) as dst:
                                 dst.write(data, 1)
                             
-                            print(f"[DEBUG] Successfully converted GMRT NetCDF to GeoTIFF")
                             return True
                         except Exception as e:
-                            print(f"[DEBUG] Error processing GMRT 1D format: {e}")
                             import traceback
-                            print(f"[DEBUG] Traceback: {traceback.format_exc()}")
                             return False
                     
                     # Find the 2D data variable (standard NetCDF format)
@@ -1163,25 +1015,18 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
                         var = nc.variables[var_name]
                         if len(var.dimensions) >= 2:
                             data_var = var_name
-                            print(f"[DEBUG] Found 2D data variable: {data_var}")
-                            print(f"[DEBUG] Variable dimensions: {var.dimensions}")
                             break
                     
                     if data_var is None:
-                        print(f"[DEBUG] No 2D variable found in NetCDF file")
-                        print(f"[DEBUG] All variables: {[(name, len(nc.variables[name].dimensions)) for name in nc.variables]}")
                         return False
                     
                     # Get the data
                     data = nc.variables[data_var][:]
-                    print(f"[DEBUG] Data shape: {data.shape}, dtype: {data.dtype}")
                     if len(data.shape) == 3:
                         data = data[0, :, :]
-                        print(f"[DEBUG] Reduced 3D to 2D, new shape: {data.shape}")
                     
                     # Get coordinates
                     dims = nc.variables[data_var].dimensions
-                    print(f"[DEBUG] Data variable dimensions: {dims}")
                     lat_var = None
                     lon_var = None
                     
@@ -1191,7 +1036,6 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
                             var = nc.variables[dim]
                             if hasattr(var, 'standard_name'):
                                 std_name = var.standard_name.lower()
-                                print(f"[DEBUG] Dimension {dim} has standard_name: {std_name}")
                                 if 'lat' in std_name:
                                     lat_var = dim
                                 elif 'lon' in std_name:
@@ -1224,19 +1068,12 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
                                     lon_var = name
                                     break
                     
-                    print(f"[DEBUG] Found lat_var: {lat_var}, lon_var: {lon_var}")
                     
                     if lat_var is None or lon_var is None:
-                        print(f"[DEBUG] Could not find coordinate variables")
-                        print(f"[DEBUG] Available variables: {list(nc.variables.keys())}")
-                        print(f"[DEBUG] Data dimensions: {dims}")
                         return False
                     
                     lats = nc.variables[lat_var][:]
                     lons = nc.variables[lon_var][:]
-                    print(f"[DEBUG] Lats shape: {lats.shape}, Lons shape: {lons.shape}")
-                    print(f"[DEBUG] Lat range: {float(lats.min())} to {float(lats.max())}")
-                    print(f"[DEBUG] Lon range: {float(lons.min())} to {float(lons.max())}")
                     
                     # Calculate transform
                     nrows, ncols = data.shape
@@ -1245,13 +1082,10 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
                     lon_min = float(lons.min())
                     lon_max = float(lons.max())
                     
-                    print(f"[DEBUG] Data shape: {nrows} rows x {ncols} cols")
-                    print(f"[DEBUG] Bounds: lon={lon_min:.6f} to {lon_max:.6f}, lat={lat_min:.6f} to {lat_max:.6f}")
                     
                     # Create transform
                     from rasterio.transform import from_bounds
                     transform = from_bounds(lon_min, lat_min, lon_max, lat_max, ncols, nrows)
-                    print(f"[DEBUG] Transform: {transform}")
                     
                     # Only use tiled format if dimensions are compatible
                     # Tiled TIFF requires block dimensions to be multiples of 16
@@ -1282,19 +1116,14 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
                     if hasattr(nc.variables[data_var], '_FillValue'):
                         nodata = float(nc.variables[data_var]._FillValue)
                         profile['nodata'] = nodata
-                        print(f"[DEBUG] Using nodata value: {nodata}")
                     
                     # Write to GeoTIFF
-                    print(f"[DEBUG] Writing GeoTIFF to: {output_path}")
                     with rasterio.open(output_path, 'w', **profile) as dst:
                         dst.write(data, 1)
                     
-                    print(f"[DEBUG] Successfully converted NetCDF to GeoTIFF")
                     return True
             except Exception as e:
-                print(f"[DEBUG] Error converting NetCDF with netCDF4: {e}")
                 import traceback
-                print(f"[DEBUG] Traceback: {traceback.format_exc()}")
                 return False
         
         # If we got a rasterio source, use it
@@ -1308,9 +1137,6 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
                 src_crs = src.crs
                 src_transform = src.transform
                 
-                print(f"[DEBUG] Source bounds: {src_bounds}")
-                print(f"[DEBUG] Source CRS: {src_crs}")
-                print(f"[DEBUG] Source transform: {src_transform}")
                 
                 # Ensure CRS is EPSG:4326 (WGS84) for geographic data
                 # If source CRS is None or different, use EPSG:4326
@@ -1318,21 +1144,16 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
                 needs_reproject = False
                 
                 if src_crs is None:
-                    print(f"[DEBUG] Source CRS is None, using EPSG:4326 and recalculating transform")
                     needs_reproject = True
                 elif not src_crs.is_geographic:
-                    print(f"[DEBUG] Warning: Source CRS is projected ({src_crs}), using EPSG:4326 and recalculating transform")
                     needs_reproject = True
                 elif src_crs.to_epsg() != 4326:
-                    print(f"[DEBUG] Source CRS is geographic but not EPSG:4326 ({src_crs}), using EPSG:4326")
                     needs_reproject = True
                 else:
                     # Check if bounds look reasonable for geographic coordinates
                     # Geographic bounds should be: lon -180 to 180, lat -90 to 90
                     if (src_bounds[0] < -200 or src_bounds[2] > 200 or 
                         src_bounds[1] < -100 or src_bounds[3] > 100):
-                        print(f"[DEBUG] Warning: Bounds look wrong for geographic CRS, recalculating transform")
-                        print(f"[DEBUG] Bounds: {src_bounds}")
                         needs_reproject = True
                 
                 # Only use tiled format if dimensions are compatible
@@ -1345,7 +1166,6 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
                 # The issue is that we don't have the original geographic bounds from the NetCDF
                 # when opened via GDAL pattern. We should fall back to netCDF4 approach if this happens.
                 if needs_reproject:
-                    print(f"[DEBUG] Cannot recalculate transform without original bounds, falling back to netCDF4 approach")
                     src.close()
                     # Fall through to netCDF4 approach
                     src = None
@@ -1376,29 +1196,21 @@ def convert_netcdf_to_geotiff(netcdf_path, output_path):
                         profile['blockxsize'] = (profile['blockxsize'] // 16) * 16
                         profile['blockysize'] = (profile['blockysize'] // 16) * 16
                     
-                    print(f"[DEBUG] Writing GeoTIFF with tiled={use_tiled}, shape={data.shape}, CRS={output_crs}")
-                    print(f"[DEBUG] Output bounds will be: {src_bounds}")
                     # Write to GeoTIFF
                     with rasterio.open(output_path, 'w', **profile) as dst:
                         dst.write(data, 1)
                     src.close()
-                    print(f"[DEBUG] Successfully wrote GeoTIFF")
                     return True
             except Exception as e:
-                print(f"[DEBUG] Error writing GeoTIFF from rasterio source: {e}")
                 import traceback
-                print(f"[DEBUG] Traceback: {traceback.format_exc()}")
                 if src:
                     src.close()
                 return False
         
-        print(f"[DEBUG] Could not open NetCDF file with any method")
         return False
         
     except Exception as e:
-        print(f"[DEBUG] Error converting NetCDF to GeoTIFF: {e}")
         import traceback
-        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
         return False
 
 
@@ -1414,7 +1226,6 @@ def convert_geotiff_to_esri_ascii(geotiff_path, output_path):
         bool: True if successful, False otherwise
     """
     if rasterio is None:
-        print(f"[DEBUG] Cannot convert GeoTIFF to ESRI ASCII: rasterio not available")
         return False
     
     try:
@@ -1448,10 +1259,6 @@ def convert_geotiff_to_esri_ascii(geotiff_path, output_path):
             # So: yllcorner = bounds.top - nrows * cell_size
             yllcorner_adjusted = bounds.top - nrows * cell_size
             
-            print(f"[DEBUG] ESRI ASCII conversion: calculated cell_size_x={cell_size_x:.9f}°, cell_size_y={cell_size_y:.9f}°")
-            print(f"[DEBUG] Using cell_size={cell_size:.9f}° for ESRI ASCII (using X cell size since east-west is correct)")
-            print(f"[DEBUG] Original yllcorner={yllcorner:.9f}°, adjusted yllcorner={yllcorner_adjusted:.9f}°")
-            print(f"[DEBUG] Calculated north extent with adjusted yllcorner: {yllcorner_adjusted + nrows * cell_size:.9f}°, actual bounds.top: {bounds.top:.9f}°")
             
             yllcorner = yllcorner_adjusted
             
@@ -1481,12 +1288,9 @@ def convert_geotiff_to_esri_ascii(geotiff_path, output_path):
                 f.write(f"NODATA_value {nodata_value}\n")
                 np.savetxt(f, data, fmt='%.6f')
         
-        print(f"[DEBUG] Successfully converted GeoTIFF to ESRI ASCII: {output_path}")
         return True
     except Exception as e:
-        print(f"[DEBUG] Error converting GeoTIFF to ESRI ASCII: {e}")
         import traceback
-        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
         return False
 
 
@@ -1594,9 +1398,7 @@ def convert_netcdf_to_esri_ascii(netcdf_path, output_path):
         
         return True
     except Exception as e:
-        print(f"[DEBUG] Error converting NetCDF to ESRI ASCII: {e}")
         import traceback
-        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
         return False
 
 
@@ -1673,12 +1475,9 @@ def convert_netcdf_to_coards(netcdf_path, output_path):
                 else:
                     dst.Conventions = 'COARDS'
         
-        print(f"[DEBUG] Successfully converted NetCDF to COARDS: {output_path}")
         return True
     except Exception as e:
-        print(f"[DEBUG] Error converting NetCDF to COARDS: {e}")
         import traceback
-        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
         return False
 
 
@@ -1695,7 +1494,6 @@ def convert_geotiff_to_coards(geotiff_path, output_path):
         bool: True if successful, False otherwise
     """
     if rasterio is None or netCDF4 is None:
-        print(f"[DEBUG] Cannot convert GeoTIFF to COARDS: rasterio or netCDF4 not available")
         return False
     
     try:
@@ -1708,15 +1506,12 @@ def convert_geotiff_to_coards(geotiff_path, output_path):
         try:
             # Convert GeoTIFF to NetCDF
             if not convert_geotiff_to_netcdf(geotiff_path, temp_netcdf_path):
-                print(f"[DEBUG] Failed to convert GeoTIFF to NetCDF for COARDS conversion")
                 return False
             
             # Convert NetCDF to COARDS
             if not convert_netcdf_to_coards(temp_netcdf_path, output_path):
-                print(f"[DEBUG] Failed to convert NetCDF to COARDS")
                 return False
             
-            print(f"[DEBUG] Successfully converted GeoTIFF to COARDS: {output_path}")
             return True
         finally:
             # Clean up temporary NetCDF file
@@ -1724,12 +1519,9 @@ def convert_geotiff_to_coards(geotiff_path, output_path):
                 if os.path.exists(temp_netcdf_path):
                     os.remove(temp_netcdf_path)
             except Exception as e:
-                print(f"[DEBUG] Warning: Could not delete temporary NetCDF file: {e}")
-                
+                pass
     except Exception as e:
-        print(f"[DEBUG] Error converting GeoTIFF to COARDS: {e}")
         import traceback
-        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
         return False
 
 
@@ -1745,7 +1537,6 @@ def convert_geotiff_to_netcdf(geotiff_path, output_path):
         bool: True if successful, False otherwise
     """
     if rasterio is None or netCDF4 is None:
-        print(f"[DEBUG] Cannot convert GeoTIFF to NetCDF: rasterio or netCDF4 not available")
         return False
     
     try:
@@ -1814,12 +1605,9 @@ def convert_geotiff_to_netcdf(geotiff_path, output_path):
                     if crs.to_epsg() == 4326:
                         nc.geospatial_crs = 'EPSG:4326'
         
-        print(f"[DEBUG] Successfully converted GeoTIFF to NetCDF: {output_path}")
         return True
     except Exception as e:
-        print(f"[DEBUG] Error converting GeoTIFF to NetCDF: {e}")
         import traceback
-        print(f"[DEBUG] Traceback: {traceback.format_exc()}")
         return False
 
 
@@ -1880,9 +1668,7 @@ class DownloadWorker(QThread):
             # Log the grid download request
             param_str = ", ".join([f"{k}={v}" for k, v in self.params.items()])
             print(f"[DownloadWorker] Downloading bathymetry grid: {param_str}")
-            print(f"[DEBUG] DownloadWorker.run: sending request to {GMRT_URL}")
             with requests.get(GMRT_URL, params=self.params, stream=True, timeout=120) as r:
-                print(f"[DEBUG] DownloadWorker.run: response status {r.status_code}")
                 if r.status_code == 200:
                     # Successfully connected, download the file in chunks
                     # Download to temporary GeoTIFF file first
@@ -1992,51 +1778,39 @@ class GMRTGrabber(QWidget):
     """
     
     def __init__(self):
-        print("[DEBUG] Entering GMRTGrabber.__init__")
         super().__init__()
         self.setWindowTitle(f"GMRT Bathymetry Grid Downloader v{__version__} - pjohnson@ccom.unh.edu")
-        print("[DEBUG] Set window title")
         # Set window icon
         icon_path = os.path.join(os.path.dirname(__file__), "media", "GMRT-logo2020.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
-            print(f"[DEBUG] Set window icon: {icon_path}")
         else:
-            print(f"[DEBUG] Icon file not found: {icon_path}")
+            pass
         # Data structures for managing tiled downloads
         self.tiles_to_download = []        # List of tile boundaries to download
         self.current_tile_index = 0        # Current tile being downloaded
         self.download_dir = ""             # Directory for saving downloaded files
         self.downloaded_tile_files = []    # List of successfully downloaded tile files
-        print("[DEBUG] Initialized download state variables")
         # Timer for managing sequential tile downloads
         self.download_timer = QTimer()
         self.download_timer.timeout.connect(self.download_next_tile)
-        print("[DEBUG] Initialized download timer")
         
         # Timer for debouncing map preview updates when typing coordinates
         self.map_preview_timer = QTimer()
         self.map_preview_timer.setSingleShot(True)  # Only fire once
         self.map_preview_timer.timeout.connect(self.update_map_preview)
-        print("[DEBUG] Initialized map preview debounce timer")
         # Configuration and state management
         self.config_file = os.path.join(os.path.dirname(__file__), "gmrtgrab_config.json")
-        print(f"[DEBUG] Config file path: {self.config_file}")
         self.last_download_dir = self.load_last_download_dir()
-        print(f"[DEBUG] Last download dir: {self.last_download_dir}")
         # Worker threads for background operations
         self.current_worker = None         # Current download worker
         self.current_map_worker = None     # Current map preview worker
-        print("[DEBUG] About to call init_ui()")
         # Initialize the user interface
         self.init_ui()
-        print("[DEBUG] Finished init_ui()")
         # Set default window size
         self.resize(1200, 800)
-        print("[DEBUG] Window resized to 1200x800")
 
     def load_last_download_dir(self):
-        print("[DEBUG] Entering load_last_download_dir")
         """
         Load the last used download directory from the configuration file.
         
@@ -2049,23 +1823,18 @@ class GMRTGrabber(QWidget):
         """
         try:
             if os.path.exists(self.config_file):
-                print("[DEBUG] Config file exists")
                 with open(self.config_file, 'r') as f:
                     config = json.load(f)
                     last_dir = config.get('last_download_dir', '')
-                    print(f"[DEBUG] Loaded last_download_dir from config: {last_dir}")
                     # Verify the directory still exists
                     if last_dir and os.path.exists(last_dir):
-                        print("[DEBUG] Last download dir exists on disk")
                         return last_dir
         except Exception as e:
-            print(f"[DEBUG] Exception in load_last_download_dir: {e}")
             # If any error occurs (file doesn't exist, invalid JSON, etc.),
             # we'll use the default directory
             pass
         
         # Default to user's home directory
-        print("[DEBUG] Returning default home directory")
         return os.path.expanduser("~")
 
     def get_layer_type(self):
@@ -2108,7 +1877,6 @@ class GMRTGrabber(QWidget):
             pass
 
     def init_ui(self):
-        print("[DEBUG] Entering init_ui")
         """
         Initialize and create the complete user interface.
         
@@ -2317,17 +2085,25 @@ class GMRTGrabber(QWidget):
         # === CREDIT LINE ===
         # Required attribution for GMRT data usage
         # This citation must be included when using GMRT data
+        credit_group = QGroupBox("Credit")
+        credit_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        credit_group.setStyleSheet("QGroupBox { padding-top: 2px; }")
+        credit_layout = QVBoxLayout()
+        credit_layout.setContentsMargins(2, 2, 2, 2)  # Minimal margins
+        credit_layout.setSpacing(0)  # No spacing
         credit_label = QLabel(
-            "Credit: Ryan, W.B.F., S.M. Carbotte, J.O. Coplan, S. O'Hara, A. Melkonian, "
+            "Ryan, W.B.F., S.M. Carbotte, J.O. Coplan, S. O'Hara, A. Melkonian, "
             "R. Arko, R.A. Weissel, V. Ferrini, A. Goodwillie, F. Nitsche, J. Bonczkowski, "
             "and R. Zemsky (2009), Global Multi-Resolution Topography synthesis, "
             "Geochem. Geophys. Geosyst., 10, Q03014, doi: 10.1029/2008GC002332"
         )
         credit_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         credit_label.setWordWrap(True)  # Allow text to wrap to multiple lines
-        credit_label.setStyleSheet("QLabel { color: gray; font-size: 9pt; padding: 5px; }")
-        credit_label.setMaximumHeight(60)  # Limit height to save space
-        right_layout.addWidget(credit_label)
+        credit_label.setStyleSheet("QLabel { color: gray; font-size: 9pt; padding: 0px; }")
+        credit_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        credit_layout.addWidget(credit_label)
+        credit_group.setLayout(credit_layout)
+        right_layout.addWidget(credit_group)
         
         right_panel.setLayout(right_layout)
         
@@ -2346,8 +2122,6 @@ class GMRTGrabber(QWidget):
         
         # Set the main layout for the application window
         self.setLayout(main_layout)
-        print("[DEBUG] About to set main layout")
-        print("[DEBUG] Leaving init_ui")
         
         # === INITIALIZATION ===
         
@@ -2362,7 +2136,7 @@ class GMRTGrabber(QWidget):
         # Set default coordinates for a sample area
         self.west_spin.setValue(-180.0)   # Western boundary
         self.east_spin.setValue(180.0)    # Eastern boundary
-        self.south_spin.setValue(-85.0)   # Southern boundary (GMRT data limit)
+        self.south_spin.setValue(-83.0)   # Southern boundary (default)
         self.north_spin.setValue(85.0)    # Northern boundary (GMRT data limit)
         self.west_spin.blockSignals(False)
         self.east_spin.blockSignals(False)
@@ -2383,7 +2157,6 @@ class GMRTGrabber(QWidget):
         self.map_preview_timer.start(500)  # 500ms delay
 
     def update_map_preview(self):
-        print("[DEBUG] Entering update_map_preview")
         """
         Update the map preview with the current coordinate settings.
         
@@ -2396,7 +2169,6 @@ class GMRTGrabber(QWidget):
         east = self.east_spin.value()
         south = self.south_spin.value()
         north = self.north_spin.value()
-        print(f"[DEBUG] update_map_preview: coords: W={west}, E={east}, S={south}, N={north}")
         
         # Check that coordinates form a valid rectangle
         if east <= west or north <= south:
@@ -2405,11 +2177,9 @@ class GMRTGrabber(QWidget):
         
         # Log the map preview request
         self.log_message(f"Requesting map preview: {west:.4f}°E to {east:.4f}°E, {south:.4f}°N to {north:.4f}°N")
-        print("[DEBUG] update_map_preview: after validation and before worker start")
         
         # Do not start a new worker if the previous one is still running
         if self.current_map_worker and self.current_map_worker.isRunning():
-            print("[DEBUG] update_map_preview: previous map worker still running, skipping new request")
             return
         
         # Create new map worker with current settings
@@ -2426,9 +2196,7 @@ class GMRTGrabber(QWidget):
         # Update UI to show loading state
         self.map_status_label.setText("Map: Loading...")
         self.refresh_map_btn.setEnabled(False)  # Prevent multiple requests
-        print("[DEBUG] update_map_preview: starting map worker")
         self.current_map_worker.start()  # Start the background download
-        print("[DEBUG] update_map_preview: map worker started")
     
     def on_map_loaded(self, pixmap):
         """
@@ -3187,20 +2955,16 @@ class GMRTGrabber(QWidget):
     def start_mosaicking(self):
         """Start the mosaicking process after a delay"""
         try:
-            print("[DEBUG] === START_MOSAICKING CALLED ===")
             self.log_message("=== START_MOSAICKING CALLED ===")
             self.status_label.setText("Mosaicking tiles into single GeoTIFF...")
             self.status_label.repaint()
-            print("[DEBUG] Status label updated")
             self.log_message("Starting mosaicking worker thread...")
 
             # Use rasterio for mosaicking
-            print("[DEBUG] Using rasterio for mosaicking")
             self.log_message("Using rasterio for mosaicking")
 
             # Create and start the mosaic worker thread
             # Note: delete_tiles_checkbox is None since tiles are always deleted after mosaicking
-            print(f"[DEBUG] Creating MosaicWorker with {len(self.downloaded_tile_files)} tiles")
             self.mosaic_worker = MosaicWorker(
                 self.downloaded_tile_files,
                 self.download_dir,
@@ -3213,24 +2977,18 @@ class GMRTGrabber(QWidget):
                 self.split_checkbox,
                 self.format_type
             )
-            print("[DEBUG] Connecting signals...")
             self.mosaic_worker.progress.connect(self.on_mosaic_progress)
             self.mosaic_worker.finished.connect(self.on_mosaic_finished)
-            print("[DEBUG] Starting worker thread...")
             self.mosaic_worker.start()
-            print("[DEBUG] Worker thread started successfully")
             
         except Exception as e:
             import traceback
-            print(f"[DEBUG] ERROR in start_mosaicking: {str(e)}")
-            print(f"[DEBUG] Traceback: {traceback.format_exc()}")
             self.log_message(f"ERROR in start_mosaicking: {str(e)}")
             self.log_message(f"Traceback: {traceback.format_exc()}")
             self.finish_tile_download()
     
     def on_mosaic_progress(self, message):
         """Handle progress updates from mosaic worker"""
-        print(f"[DEBUG] Mosaic progress: {message}")
         self.log_message(f"Mosaic: {message}")
         self.status_label.setText(f"Mosaicking: {message}")
         self.status_label.repaint()
@@ -3238,18 +2996,15 @@ class GMRTGrabber(QWidget):
     def on_mosaic_finished(self, success, result):
         """Handle completion of mosaic worker"""
         try:
-            print(f"[DEBUG] Mosaic worker finished - Success: {success}, Result: {result}")
             self.log_message(f"Mosaic worker finished - Success: {success}, Result: {result}")
             
             if success:
-                print("[DEBUG] Mosaicking completed successfully")
                 self.log_message("✓ Mosaicking completed successfully")
                 self.status_label.setText("Mosaicking completed successfully")
                 
                 # Get the mosaic path from the worker
                 if hasattr(self.mosaic_worker, 'mosaic_path') and self.mosaic_worker.mosaic_path:
                     mosaic_path = self.mosaic_worker.mosaic_path
-                    print(f"[DEBUG] Mosaic file created: {mosaic_path}")
                     
                     # Always delete individual tile files after mosaicking
                     deleted_count = 0
@@ -3258,23 +3013,18 @@ class GMRTGrabber(QWidget):
                             if os.path.exists(tile_file):
                                 os.remove(tile_file)
                                 deleted_count += 1
-                                print(f"[DEBUG] Deleted tile: {os.path.basename(tile_file)}")
                         except Exception as e:
-                            print(f"[DEBUG] Error deleting tile {tile_file}: {str(e)}")
-                    
-                    print(f"[DEBUG] Deleted {deleted_count} individual tile files")
+                            pass
                     
                     # Get format type
                     format_type = self.format_type
                     
                     # Apply splitting to the mosaicked file if requested
                     if self.split_checkbox.isChecked():
-                        print("[DEBUG] Applying split to mosaicked file...")
                         self.log_message("Applying split to mosaicked file...")
                         self.split_grid_file(mosaic_path, format_type)
                     # Convert to NetCDF if format is NetCDF and split is not enabled
                     elif format_type == 'netcdf':
-                        print("[DEBUG] Converting mosaicked file to NetCDF...")
                         self.log_message("Converting mosaicked file to NetCDF...")
                         base, ext = os.path.splitext(mosaic_path)
                         # If filename already has .nc extension, use a temp file for conversion
@@ -3309,7 +3059,6 @@ class GMRTGrabber(QWidget):
                                 self.log_message(f"Failed to convert mosaic to NetCDF, keeping GeoTIFF file")
                     # Convert to COARDS if format is COARDS and split is not enabled
                     elif format_type == 'coards':
-                        print("[DEBUG] Converting mosaicked file to COARDS...")
                         self.log_message("Converting mosaicked file to COARDS...")
                         base, ext = os.path.splitext(mosaic_path)
                         # If filename already has .grd extension, use a temp file for conversion
@@ -3349,11 +3098,9 @@ class GMRTGrabber(QWidget):
                     self.status_label.setText(f"Mosaic complete: {os.path.basename(mosaic_path)} in {self.download_dir}")
                     QMessageBox.information(self, "Success", f"Mosaicked {len(self.downloaded_tile_files)} tiles into:\n{mosaic_path}")
                 else:
-                    print("[DEBUG] ERROR: No mosaic path found")
                     self.log_message("ERROR: No mosaic path found")
                     self.finish_tile_download()
             else:
-                print(f"[DEBUG] Mosaicking failed: {result}")
                 self.log_message(f"✗ Mosaicking failed: {result}")
                 self.status_label.setText("Mosaicking failed")
                 self.download_btn.setText("Download Grid")
@@ -3363,8 +3110,6 @@ class GMRTGrabber(QWidget):
                 
         except Exception as e:
             import traceback
-            print(f"[DEBUG] ERROR in on_mosaic_finished: {str(e)}")
-            print(f"[DEBUG] Traceback: {traceback.format_exc()}")
             self.log_message(f"ERROR in on_mosaic_finished: {str(e)}")
             self.log_message(f"Traceback: {traceback.format_exc()}")
             self.finish_tile_download()
@@ -3597,11 +3342,9 @@ class GMRTGrabber(QWidget):
                     if temp_file and os.path.exists(temp_file):
                         try:
                             os.remove(temp_file)
-                            print(f"[DEBUG] Cleaned up temporary file: {temp_file}")
                         except Exception as e:
-                            print(f"[DEBUG] Could not delete temporary file {temp_file}: {e}")
+                            pass
                 except Exception as e:
-                    print(f"[DEBUG] Error closing dataset: {e}")
                     pass  # Ignore errors when closing
             
             # Always delete individual tile files after mosaicking
@@ -3676,7 +3419,6 @@ class GMRTGrabber(QWidget):
         self.download_single_grid(params, file_name, self.on_single_download_finished, format_type)
 
     def on_rectangle_selected(self, bounds):
-        print(f"[DEBUG] on_rectangle_selected called with bounds: {bounds}")
         # Block signals to prevent multiple update_map_preview calls
         self.west_spin.blockSignals(True)
         self.east_spin.blockSignals(True)
@@ -3693,13 +3435,9 @@ class GMRTGrabber(QWidget):
         self.south_spin.blockSignals(False)
         self.north_spin.blockSignals(False)
 
-        print("[DEBUG] on_rectangle_selected: set spin boxes")
         self.map_widget.clear_selection()
-        print("[DEBUG] on_rectangle_selected: cleared selection")
         self.draw_rect_btn.setChecked(False)
-        print("[DEBUG] on_rectangle_selected: draw_rect_btn unchecked")
         self.update_map_preview() # Only one call now
-        print("[DEBUG] on_rectangle_selected: called update_map_preview")
         self.log_message(f"Rectangle selected: {bounds}")
 
     def zoom_to_default(self):
@@ -3713,7 +3451,7 @@ class GMRTGrabber(QWidget):
         self.north_spin.blockSignals(True)
         self.west_spin.setValue(-180.0)
         self.east_spin.setValue(180.0)
-        self.south_spin.setValue(-85.0)
+        self.south_spin.setValue(-83.0)
         self.north_spin.setValue(85.0)
         self.west_spin.blockSignals(False)
         self.east_spin.blockSignals(False)
@@ -3932,7 +3670,6 @@ if __name__ == "__main__":
         print("Starting GMRT Bathymetry Grid Downloader...")
         
         # Use rasterio for mosaicking
-        print("[DEBUG] Using rasterio for mosaicking")
         
         app = QApplication(sys.argv)
         print("QApplication created successfully")

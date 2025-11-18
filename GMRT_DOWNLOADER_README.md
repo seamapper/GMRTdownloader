@@ -6,9 +6,9 @@ A standalone executable for downloading bathymetry data from the Global Multi-Re
 
 - **Interactive GUI**: User-friendly interface for selecting download parameters
 - **Map Preview**: Visual preview of the selected area using GMRT ImageServer
-- **Multiple Formats**: Support for GeoTIFF, NetCDF, COARDS, and ESRI ASCII formats
-- **Resolution Options**: High, low, medium, max resolution or custom meter resolution
-- **Tiled Downloads**: Automatic tiling for large datasets (>3 degrees)
+- **Multiple Formats**: Support for GeoTIFF, NetCDF, and COARDS formats
+- **Resolution Options**: Dropdown menu with preset resolutions: 100m, 200m, 400m, 800m (default: 400m)
+- **Tiled Downloads**: Automatic tiling for large downloads
 - **Activity Logging**: Detailed log of all operations with timestamps
 - **Coordinate Validation**: Automatic validation of geographic coordinates
 
@@ -22,9 +22,11 @@ A standalone executable for downloading bathymetry data from the Global Multi-Re
    - East (maxlongitude): -180° to 180°
    - South (minlatitude): -90° to 90°
    - North (maxlatitude): -90° to 90°
-3. **Choose format**: GeoTIFF, NetCDF, COARDS, or ESRI ASCII
-4. **Select resolution**: High, low, medium, max, or custom meter resolution
-5. **Choose layer**: Topo or topo-mask
+3. **Choose format**: GeoTIFF, NetCDF, or COARDS
+4. **Select cell resolution**: Choose from dropdown (100m, 200m, 400m, or 800m per pixel) - default is 400m
+5. **Choose layer**: 
+   - **Topo-Bathy**: Standard bathymetry and topography data
+   - **Topo-Bathy (Observed Only)**: Only direct measurements, no interpolated data
 6. **Enable tiling** if downloading large areas
 7. **Click "Refresh Map"** to preview the selected area
 8. **Click "Download Grid"** to start the download
@@ -38,15 +40,17 @@ A standalone executable for downloading bathymetry data from the Global Multi-Re
 ### Download Options
 
 - **Single File**: Download the entire area as one file
-- **Tiled Dataset**: Automatically break large areas into 3°x3° tiles with overlap
+- **Tiled Dataset**: Automatically breaks large areas into manageable tiles
+- **Intelligent Mosaicing**: Automatically combines downloaded tiles into a final mosaic
 - **Progress Tracking**: Real-time status updates and completion notifications
 
 ## File Formats
 
-- **GeoTIFF (.tif)**: Raster format with embedded georeference information
-- **NetCDF (.nc)**: Scientific data format with metadata
+- **GeoTIFF (.tif)**: Raster format with embedded georeference information (recommended for GIS)
+- **NetCDF (.nc)**: Scientific data format with comprehensive metadata (full mosaicing support)
 - **COARDS (.grd)**: ASCII grid format
-- **ESRI ASCII (.asc)**: Simple ASCII grid format
+
+All formats support automatic tiling and mosaicing when enabled.
 
 ## System Requirements
 
@@ -86,6 +90,23 @@ For issues with the application or data downloads, please refer to:
 ## Version Information
 
 - **Application**: GMRT Bathymetry Grid Downloader
-- **Build Date**: July 2025
+- **Current Version**: v2025.06
 - **Python**: PyQt6-based GUI
-- **Dependencies**: requests, PyQt6 
+- **Dependencies**: requests, PyQt6, numpy, rasterio, netCDF4
+
+## Version History
+
+- **v2025.06** - Streamlined download process and UI improvements
+  - Major change to streamline the download process by removing tiling options
+  - Reduced padding in Credit box for more compact UI
+  - Improved overall UI spacing and layout
+- **v2025.05** - Major UI and functionality improvements
+  - Changed Cell Resolution to dropdown menu (100m, 200m, 400m, 800m)
+  - Removed Data Resolution option (always use Cell Resolution)
+  - Relabeled layer types for clarity (Topo-Bathy, Topo-Bathy Observed Only)
+  - Mosaicing now prefers shallower values in overlapping areas
+  - Fixed directory selection to remember last directory within session
+  - Added comprehensive NetCDF file support for mosaicing
+  - Implemented automatic tile overlap calculation (2 grid cells based on resolution)
+  - Removed manual overlap control (now automatic)
+  - Updated application icon to GMRT-logo2020.ico 

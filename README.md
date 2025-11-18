@@ -13,10 +13,10 @@ The GMRT Bathymetry Grid Downloader provides an intuitive graphical interface fo
 ## Features
 
 - 🗺️ **Interactive Map Preview** - Visual preview of selected areas using GMRT ImageServer
-- 📥 **Multiple Output Formats** - GeoTIFF, NetCDF, COARDS, and ESRI ASCII (with NetCDF mosaicing support)
+- 📥 **Multiple Output Formats** - GeoTIFF, NetCDF, and COARDS (with NetCDF mosaicing support)
 - 🎯 **Cell Resolution Selection** - Dropdown menu with preset resolutions: 100m, 200m, 400m, 800m (default: 400m)
-- 🧩 **Automatic Tiling** - Handles large datasets by automatically breaking them into manageable tiles with automatic overlap based on resolution
-- 🔀 **Intelligent Mosaicing** - Automatically combines tiles with preference for shallower values in overlapping areas
+- 🧩 **Automatic Tiling** - Handles large downloads by automatically breaking them into manageable tiles 
+- 🔀 **Intelligent Mosaicing** - Automatically combines downloaded tiles into a final mosaic
 - 📊 **Real-time Activity Logging** - Detailed log of all operations with timestamps
 - ✅ **Coordinate Validation** - Automatic validation of geographic coordinates
 - 💾 **Session Memory** - Remembers last download directory within the same session
@@ -76,7 +76,7 @@ Download the latest release for your platform:
    - East (maxlongitude): -180° to 180°
    - South (minlatitude): -90° to 90°
    - North (maxlatitude): -90° to 90°
-3. **Choose output format:** GeoTIFF, NetCDF, COARDS, or ESRI ASCII
+3. **Choose output format:** GeoTIFF, NetCDF, or COARDS
 4. **Select cell resolution:** Choose from dropdown (100m, 200m, 400m, or 800m per pixel) - default is 400m
 5. **Choose layer:** 
    - **Topo-Bathy**: Standard bathymetry and topography data
@@ -104,7 +104,6 @@ Download the latest release for your platform:
 - **GeoTIFF (.tif)**: Raster format with embedded georeference information (recommended for GIS)
 - **NetCDF (.nc)**: Scientific data format with comprehensive metadata (full mosaicing support)
 - **COARDS (.grd)**: ASCII grid format
-- **ESRI ASCII (.asc)**: Simple ASCII grid format
 
 All formats support automatic tiling and mosaicing when enabled.
 
@@ -239,6 +238,10 @@ Contributions are welcome! Please feel free to submit a Pull Request. For major 
 
 ## Version History
 
+- **v2025.06** - Streamlined download process and UI improvements
+  - Major change to streamline the download process by removing tiling options
+  - Reduced padding in Credit box for more compact UI
+  - Improved overall UI spacing and layout
 - **v2025.05** - Major UI and functionality improvements
   - Changed Cell Resolution to dropdown menu (100m, 200m, 400m, 800m)
   - Removed Data Resolution option (always use Cell Resolution)
