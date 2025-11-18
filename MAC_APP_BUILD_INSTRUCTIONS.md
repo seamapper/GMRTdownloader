@@ -74,19 +74,19 @@ from setuptools import setup
 
 APP = ['GMRT_Downloader.py']
 DATA_FILES = [
-    ('media', ['media/mgds.ico']),
+    ('media', ['media/GMRT-logo2020.ico', 'media/GMRT-logo2020.png']),
     ('', ['gmrtgrab_config.json']),
 ]
 OPTIONS = {
     'argv_emulation': True,
-    'iconfile': 'media/mgds.icns',  # You'll need to convert .ico to .icns (see Icon section)
+    'iconfile': 'media/GMRT-logo2020.icns',  # You'll need to convert .ico or .png to .icns (see Icon section)
     'plist': {
         'CFBundleName': 'GMRT Downloader',
         'CFBundleDisplayName': 'GMRT Bathymetry Grid Downloader',
-        'CFBundleGetInfoString': 'GMRT Bathymetry Grid Downloader v2025.05',
+        'CFBundleGetInfoString': 'GMRT Bathymetry Grid Downloader v2025.06',
         'CFBundleIdentifier': 'org.gmrt.downloader',
-        'CFBundleVersion': '2025.05',
-        'CFBundleShortVersionString': '2025.05',
+        'CFBundleVersion': '2025.06',
+        'CFBundleShortVersionString': '2025.06',
         'NSHighResolutionCapable': True,
         'NSRequiresAquaSystemAppearance': False,
         'LSMinimumSystemVersion': '10.13',
@@ -264,15 +264,15 @@ exe = EXE(
 app = BUNDLE(
     exe,
     name='GMRT_Downloader.app',
-    icon='media/mgds.icns',  # Convert .ico to .icns first
+    icon='media/GMRT-logo2020.icns',  # Convert .ico or .png to .icns first (see Icon section)
     bundle_identifier='org.gmrt.downloader',
     info_plist={
         'NSHighResolutionCapable': True,
         'LSMinimumSystemVersion': '10.13',
         'CFBundleName': 'GMRT Downloader',
         'CFBundleDisplayName': 'GMRT Bathymetry Grid Downloader',
-        'CFBundleVersion': '2025.05',
-        'CFBundleShortVersionString': '2025.05',
+        'CFBundleVersion': '2025.06',
+        'CFBundleShortVersionString': '2025.06',
         'NSHumanReadableCopyright': 'Copyright © 2025 Paul Johnson',
         'NSAppTransportSecurity': {
             'NSAllowsArbitraryLoads': True
@@ -315,23 +315,24 @@ mkdir -p GMRT_Downloader.iconset
 # Install ImageMagick if needed
 brew install imagemagick
 
-# Convert .ico to PNG at various sizes
-convert media/mgds.ico -resize 16x16 GMRT_Downloader.iconset/icon_16x16.png
-convert media/mgds.ico -resize 32x32 GMRT_Downloader.iconset/icon_16x16@2x.png
-convert media/mgds.ico -resize 32x32 GMRT_Downloader.iconset/icon_32x32.png
-convert media/mgds.ico -resize 64x64 GMRT_Downloader.iconset/icon_32x32@2x.png
-convert media/mgds.ico -resize 128x128 GMRT_Downloader.iconset/icon_128x128.png
-convert media/mgds.ico -resize 256x256 GMRT_Downloader.iconset/icon_128x128@2x.png
-convert media/mgds.ico -resize 256x256 GMRT_Downloader.iconset/icon_256x256.png
-convert media/mgds.ico -resize 512x512 GMRT_Downloader.iconset/icon_256x256@2x.png
-convert media/mgds.ico -resize 512x512 GMRT_Downloader.iconset/icon_512x512.png
-convert media/mgds.ico -resize 1024x1024 GMRT_Downloader.iconset/icon_512x512@2x.png
+# Convert .ico or .png to PNG at various sizes
+# Using .ico file:
+convert media/GMRT-logo2020.ico -resize 16x16 GMRT_Downloader.iconset/icon_16x16.png
+convert media/GMRT-logo2020.ico -resize 32x32 GMRT_Downloader.iconset/icon_16x16@2x.png
+convert media/GMRT-logo2020.ico -resize 32x32 GMRT_Downloader.iconset/icon_32x32.png
+convert media/GMRT-logo2020.ico -resize 64x64 GMRT_Downloader.iconset/icon_32x32@2x.png
+convert media/GMRT-logo2020.ico -resize 128x128 GMRT_Downloader.iconset/icon_128x128.png
+convert media/GMRT-logo2020.ico -resize 256x256 GMRT_Downloader.iconset/icon_128x128@2x.png
+convert media/GMRT-logo2020.ico -resize 256x256 GMRT_Downloader.iconset/icon_256x256.png
+convert media/GMRT-logo2020.ico -resize 512x512 GMRT_Downloader.iconset/icon_256x256@2x.png
+convert media/GMRT-logo2020.ico -resize 512x512 GMRT_Downloader.iconset/icon_512x512.png
+convert media/GMRT-logo2020.ico -resize 1024x1024 GMRT_Downloader.iconset/icon_512x512@2x.png
 ```
 
 3. **Create .icns file:**
 
 ```bash
-iconutil -c icns GMRT_Downloader.iconset -o media/mgds.icns
+iconutil -c icns GMRT_Downloader.iconset -o media/GMRT-logo2020.icns
 ```
 
 ### Option 2: Using Online Tools
@@ -339,8 +340,8 @@ iconutil -c icns GMRT_Downloader.iconset -o media/mgds.icns
 1. Use an online converter like:
    - https://cloudconvert.com/ico-to-icns
    - https://convertio.co/ico-icns/
-2. Upload your `mgds.ico` file
-3. Download the converted `mgds.icns` file
+2. Upload your `GMRT-logo2020.ico` or `GMRT-logo2020.png` file
+3. Download the converted `GMRT-logo2020.icns` file
 4. Place it in the `media/` directory
 
 ### Option 3: Using sips (macOS built-in, simpler)
@@ -352,19 +353,19 @@ If you have a high-resolution PNG (512x512 or larger):
 mkdir -p GMRT_Downloader.iconset
 
 # Use sips to create all sizes
-sips -z 16 16 media/mgds.png --out GMRT_Downloader.iconset/icon_16x16.png
-sips -z 32 32 media/mgds.png --out GMRT_Downloader.iconset/icon_16x16@2x.png
-sips -z 32 32 media/mgds.png --out GMRT_Downloader.iconset/icon_32x32.png
-sips -z 64 64 media/mgds.png --out GMRT_Downloader.iconset/icon_32x32@2x.png
-sips -z 128 128 media/mgds.png --out GMRT_Downloader.iconset/icon_128x128.png
-sips -z 256 256 media/mgds.png --out GMRT_Downloader.iconset/icon_128x128@2x.png
-sips -z 256 256 media/mgds.png --out GMRT_Downloader.iconset/icon_256x256.png
-sips -z 512 512 media/mgds.png --out GMRT_Downloader.iconset/icon_256x256@2x.png
-sips -z 512 512 media/mgds.png --out GMRT_Downloader.iconset/icon_512x512.png
-sips -z 1024 1024 media/mgds.png --out GMRT_Downloader.iconset/icon_512x512@2x.png
+sips -z 16 16 media/GMRT-logo2020.png --out GMRT_Downloader.iconset/icon_16x16.png
+sips -z 32 32 media/GMRT-logo2020.png --out GMRT_Downloader.iconset/icon_16x16@2x.png
+sips -z 32 32 media/GMRT-logo2020.png --out GMRT_Downloader.iconset/icon_32x32.png
+sips -z 64 64 media/GMRT-logo2020.png --out GMRT_Downloader.iconset/icon_32x32@2x.png
+sips -z 128 128 media/GMRT-logo2020.png --out GMRT_Downloader.iconset/icon_128x128.png
+sips -z 256 256 media/GMRT-logo2020.png --out GMRT_Downloader.iconset/icon_128x128@2x.png
+sips -z 256 256 media/GMRT-logo2020.png --out GMRT_Downloader.iconset/icon_256x256.png
+sips -z 512 512 media/GMRT-logo2020.png --out GMRT_Downloader.iconset/icon_256x256@2x.png
+sips -z 512 512 media/GMRT-logo2020.png --out GMRT_Downloader.iconset/icon_512x512.png
+sips -z 1024 1024 media/GMRT-logo2020.png --out GMRT_Downloader.iconset/icon_512x512@2x.png
 
 # Convert to .icns
-iconutil -c icns GMRT_Downloader.iconset -o media/mgds.icns
+iconutil -c icns GMRT_Downloader.iconset -o media/GMRT-logo2020.icns
 ```
 
 ---
@@ -583,7 +584,7 @@ This will show any error messages in the terminal.
 
 - [ ] Install Python 3.8+ and required packages
 - [ ] Install py2app or PyInstaller
-- [ ] Convert icon from .ico to .icns
+- [ ] Convert icon from .ico/.png to .icns (GMRT-logo2020.icns)
 - [ ] Create setup.py or .spec file
 - [ ] Build the app
 - [ ] Test the app locally
@@ -603,8 +604,8 @@ This will show any error messages in the terminal.
 
 ## Version History
 
+- **2025.06** - Updated for v2025.06, corrected icon paths to GMRT-logo2020.ico/png/icns
 - **2025.05** - Initial Mac app build instructions
-- Based on GMRT_Downloader v2025.05
 
 ---
 

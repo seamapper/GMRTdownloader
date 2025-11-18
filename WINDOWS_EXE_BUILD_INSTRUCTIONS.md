@@ -62,7 +62,30 @@ Create a file named `GMRT_Downloader.spec` in your project directory:
 
 ```python
 # -*- mode: python ; coding: utf-8 -*-
+"""
+PyInstaller spec file for GMRT Downloader Windows executable
+Updated for current project structure
+"""
+
+import re
 from PyInstaller.utils.hooks import collect_all
+
+# Extract version from GMRT_Downloader.py (get the last uncommented version)
+version = "unknown"
+try:
+    with open('GMRT_Downloader.py', 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+        # Look for the last uncommented __version__ line
+        for line in reversed(lines):
+            # Match __version__ that is not commented out (line doesn't start with #)
+            stripped = line.lstrip()
+            if not stripped.startswith('#'):
+                match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', line)
+                if match:
+                    version = match.group(1)
+                    break
+except Exception:
+    pass
 
 # Include media files and config
 datas = [
@@ -111,7 +134,7 @@ a = Analysis(
     hookspath=[],            # Custom hooks directory
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],             # Modules to exclude
+    excludes=[],             # Modules to exclude (add unused packages here)
     noarchive=False,
     optimize=0,
 )
@@ -124,7 +147,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='GMRT_Bathymetry_Downloader',  # Output executable name
+    name=f'GMRT_Bathymetry_Downloader_v{version}',  # Output executable name with version
     debug=False,                         # Set to True for debugging
     bootloader_ignore_signals=False,
     strip=False,
@@ -137,7 +160,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='media\\mgds.ico',            # Application icon
+    icon='media\\GMRT-logo2020.ico',   # Application icon
 )
 ```
 
@@ -150,7 +173,7 @@ pyinstaller GMRT_Downloader.spec
 ```
 
 This creates:
-- `dist/GMRT_Bathymetry_Downloader.exe` - The executable file
+- `dist/GMRT_Bathymetry_Downloader_v{version}.exe` - The executable file (version extracted from GMRT_Downloader.py)
 - `build/` - Temporary build files (can be deleted)
 
 #### Option B: Using Command Line (Quick Test)
@@ -158,7 +181,7 @@ This creates:
 For a quick test without creating a spec file:
 
 ```bash
-pyinstaller --onefile --windowed --name="GMRT_Bathymetry_Downloader" --icon=media\mgds.ico --add-data "media;media" --add-data "gmrtgrab_config.json;." GMRT_Downloader.py
+pyinstaller --onefile --windowed --name="GMRT_Bathymetry_Downloader" --icon=media\GMRT-logo2020.ico --add-data "media;media" --add-data "gmrtgrab_config.json;." GMRT_Downloader.py
 ```
 
 **Command breakdown:**
@@ -175,8 +198,8 @@ pyinstaller --onefile --windowed --name="GMRT_Bathymetry_Downloader" --icon=medi
 # Navigate to dist folder
 cd dist
 
-# Run the executable
-.\GMRT_Bathymetry_Downloader.exe
+# Run the executable (replace {version} with actual version, e.g., v2025.06)
+.\GMRT_Bathymetry_Downloader_v{version}.exe
 ```
 
 ### Step 5: Clean Build (Optional)
@@ -239,7 +262,7 @@ build_exe_options = {
 exe = Executable(
     script='GMRT_Downloader.py',
     base='Win32GUI',  # Use 'Win32GUI' for no console, 'Console' for console
-    icon='media\\mgds.ico',
+    icon='media\\GMRT-logo2020.ico',
     target_name='GMRT_Bathymetry_Downloader.exe',
 )
 
@@ -337,7 +360,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='media\\mgds.ico',
+    icon='media\\GMRT-logo2020.ico',
 )
 
 coll = COLLECT(
@@ -365,12 +388,12 @@ coll = COLLECT(
 For distribution, create a ZIP file:
 
 ```powershell
-# Using PowerShell
-Compress-Archive -Path dist\GMRT_Bathymetry_Downloader.exe -DestinationPath GMRT_Downloader_v2025.05.zip
+# Using PowerShell (replace {version} with actual version, e.g., v2025.06)
+Compress-Archive -Path dist\GMRT_Bathymetry_Downloader_v*.exe -DestinationPath GMRT_Downloader_v{version}.zip
 ```
 
 Or manually:
-1. Right-click on `dist/GMRT_Bathymetry_Downloader.exe`
+1. Right-click on `dist/GMRT_Bathymetry_Downloader_v{version}.exe` (replace {version} with actual version)
 2. Send to → Compressed (zipped) folder
 
 ### Creating an Installer (Advanced)
@@ -403,11 +426,11 @@ Code signing helps prevent Windows Defender and antivirus warnings.
 ### Signing the Executable
 
 ```bash
-# Sign the executable
-signtool sign /f "path\to\certificate.pfx" /p "password" /t http://timestamp.digicert.com /d "GMRT Bathymetry Grid Downloader" /v "dist\GMRT_Bathymetry_Downloader.exe"
+# Sign the executable (replace {version} with actual version)
+signtool sign /f "path\to\certificate.pfx" /p "password" /t http://timestamp.digicert.com /d "GMRT Bathymetry Grid Downloader" /v "dist\GMRT_Bathymetry_Downloader_v{version}.exe"
 
 # Verify signature
-signtool verify /pa /v "dist\GMRT_Bathymetry_Downloader.exe"
+signtool verify /pa /v "dist\GMRT_Bathymetry_Downloader_v{version}.exe"
 ```
 
 **Note:** Code signing is optional for personal/internal use but recommended for public distribution.
@@ -572,10 +595,10 @@ pyinstaller --onefile --log-level=DEBUG GMRT_Downloader.spec
 - [ ] Install Python 3.8+ and required packages
 - [ ] Install PyInstaller: `pip install pyinstaller`
 - [ ] Create or update `GMRT_Downloader.spec` file
-- [ ] Ensure `media/mgds.ico` exists
+- [ ] Ensure `media/GMRT-logo2020.ico` exists
 - [ ] Ensure `gmrtgrab_config.json` exists
 - [ ] Build: `pyinstaller GMRT_Downloader.spec`
-- [ ] Test: Run `dist/GMRT_Bathymetry_Downloader.exe`
+- [ ] Test: Run `dist/GMRT_Bathymetry_Downloader_v*.exe` (versioned executable)
 - [ ] Test on a different machine (if possible)
 - [ ] Create ZIP archive for distribution
 - [ ] (Optional) Code sign the executable
@@ -600,11 +623,16 @@ if exist dist rmdir /s /q dist
 REM Build the executable
 pyinstaller GMRT_Downloader.spec
 
-REM Check if build was successful
-if exist dist\GMRT_Bathymetry_Downloader.exe (
+REM Check if build was successful (check for versioned executable)
+set BUILD_SUCCESS=0
+for %%f in (dist\GMRT_Bathymetry_Downloader_v*.exe) do (
     echo Build successful!
-    echo Executable location: dist\GMRT_Bathymetry_Downloader.exe
-) else (
+    echo Executable location: dist\%%~nxf
+    set BUILD_SUCCESS=1
+    goto :build_check_done
+)
+:build_check_done
+if %BUILD_SUCCESS%==0 (
     echo Build failed!
     exit /b 1
 )
@@ -631,8 +659,8 @@ build.bat
 
 ## Version History
 
+- **2025.06** - Updated for v2025.06, corrected icon path to GMRT-logo2020.ico, updated executable naming to include version
 - **2025.05** - Initial Windows .exe build instructions
-- Based on GMRT_Downloader v2025.05
 
 ---
 
