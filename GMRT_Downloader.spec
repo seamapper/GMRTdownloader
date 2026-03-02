@@ -4,7 +4,25 @@ PyInstaller spec file for GMRT Downloader Windows executable
 Updated for current project structure
 """
 
+import re
 from PyInstaller.utils.hooks import collect_all
+
+# Extract version from GMRT_Downloader.py (get the last uncommented version)
+version = "unknown"
+try:
+    with open('GMRT_Downloader.py', 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+        # Look for the last uncommented __version__ line
+        for line in reversed(lines):
+            # Match __version__ that is not commented out (line doesn't start with #)
+            stripped = line.lstrip()
+            if not stripped.startswith('#'):
+                match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', line)
+                if match:
+                    version = match.group(1)
+                    break
+except Exception:
+    pass
 
 # Include media files and config
 datas = [
@@ -66,7 +84,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='GMRT_Bathymetry_Downloader',  # Output executable name
+    name=f'GMRT_Bathymetry_Downloader_v{version}',  # Output executable name with version
     debug=False,                         # Set to True for debugging
     bootloader_ignore_signals=False,
     strip=False,
