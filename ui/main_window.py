@@ -63,6 +63,9 @@ class GMRTGrabber(QWidget):
         # Configuration and state management
         self.config_file = os.path.join(_project_root(), "gmrtgrab_config.json")
         self.last_download_dir = self.load_last_download_dir()
+        # Area-of-interest history (up to 10 extents): back/forward stacks
+        self.aoi_past = []   # AOIs you can go back to (Zoom Previous)
+        self.aoi_future = [] # AOIs you can go forward to (Zoom Next)
         # Worker threads for background operations
         self.current_worker = None         # Current download worker
         self.current_map_worker = None     # Current map preview worker
@@ -344,18 +347,25 @@ class GMRTGrabber(QWidget):
         self.map_widget.bounds_selected.connect(self.on_rectangle_selected)
         map_layout.addWidget(self.map_widget)
 
-        # Drawing controls
+        # Drawing / zoom controls
         draw_controls_layout = QHBoxLayout()
-        self.draw_rect_btn = QPushButton("Draw Bounds")
-        self.draw_rect_btn.setCheckable(True)
-        self.draw_rect_btn.setToolTip("Draw a rectangle to set bounds")
-        self.draw_rect_btn.toggled.connect(self.map_widget.enable_drawing)
-        draw_controls_layout.addWidget(self.draw_rect_btn)
+
+        self.zoom_previous_btn = QPushButton("Zoom to Previous")
+        self.zoom_previous_btn.setToolTip("Zoom to the previous Area of Interest (up to 10 steps)")
+        self.zoom_previous_btn.clicked.connect(self.zoom_to_previous)
+        self.zoom_previous_btn.setEnabled(False)  # No history at startup
+        draw_controls_layout.addWidget(self.zoom_previous_btn)
 
         self.zoom_default_btn = QPushButton("Zoom to Defaults")
         self.zoom_default_btn.setToolTip("Zoom to starting map defaults")
         self.zoom_default_btn.clicked.connect(self.zoom_to_default)
         draw_controls_layout.addWidget(self.zoom_default_btn)
+
+        self.zoom_next_btn = QPushButton("Zoom to Next")
+        self.zoom_next_btn.setToolTip("Zoom to the next Area of Interest after using Zoom to Previous")
+        self.zoom_next_btn.clicked.connect(self.zoom_to_next)
+        self.zoom_next_btn.setEnabled(False)
+        draw_controls_layout.addWidget(self.zoom_next_btn)
         
         map_layout.addLayout(draw_controls_layout)
         
@@ -407,6 +417,7 @@ class GMRTGrabber(QWidget):
         
         # Log the application startup
         self.log_message("GMRT Bathymetry Grid Downloader started")
+        self.log_message("Tip: To select an Area of Interest, move the mouse over the map (crosshair cursor) and left-drag to draw a red rectangle; the North/West/East/South fields and estimated pixels will update automatically.")
         
         # Block signals to prevent multiple update_map_preview calls during initial setup
         self.west_spin.blockSignals(True)
@@ -586,9 +597,117 @@ class GMRTGrabber(QWidget):
         self.log_area.clear()
         self.log_message("Log cleared")
 
+    def _get_current_aoi(self):
+        """Return current Area of Interest as (west, east, south, north)."""
+        return (
+            float(self.west_spin.value()),
+            float(self.east_spin.value()),
+            float(self.south_spin.value()),
+            float(self.north_spin.value()),
+        )
 
+    def _push_aoi_to_history(self, aoi):
+        """
+        Push an AOI into the 'past' stack, keeping at most 10 entries
+        and clearing the 'future' stack (invalidating forward history).
+        """
+        if aoi is None:
+            return
+        if len(self.aoi_past) > 0 and self.aoi_past[-1] == aoi:
+            return
+        self.aoi_past.append(aoi)
+        if len(self.aoi_past) > 10:
+            self.aoi_past.pop(0)
+        # New navigation path invalidates forward history
+        self.aoi_future.clear()
+        if getattr(self, "zoom_previous_btn", None) is not None:
+            self.zoom_previous_btn.setEnabled(bool(self.aoi_past))
+        if getattr(self, "zoom_next_btn", None) is not None:
+            self.zoom_next_btn.setEnabled(bool(self.aoi_future))
 
+    def zoom_to_previous(self):
+        """Zoom to the most recent previous Area of Interest (back)."""
+        if not self.aoi_past:
+            self.log_message("No previous Area of Interest in history")
+            return
+        # Current AOI becomes part of the 'future' stack
+        current = self._get_current_aoi()
+        if current is not None:
+            self.aoi_future.append(current)
+            if len(self.aoi_future) > 10:
+                self.aoi_future.pop(0)
+        prev_west, prev_east, prev_south, prev_north = self.aoi_past.pop()
 
+        # Block signals while applying previous AOI
+        self.west_spin.blockSignals(True)
+        self.east_spin.blockSignals(True)
+        self.south_spin.blockSignals(True)
+        self.north_spin.blockSignals(True)
+
+        self.west_spin.setValue(prev_west)
+        self.east_spin.setValue(prev_east)
+        self.south_spin.setValue(prev_south)
+        self.north_spin.setValue(prev_north)
+
+        self.west_spin.blockSignals(False)
+        self.east_spin.blockSignals(False)
+        self.south_spin.blockSignals(False)
+        self.north_spin.blockSignals(False)
+
+        # Update map and pixel estimate after programmatic changes
+        self.update_map_preview()
+        self.update_estimated_pixel_count()
+        self.log_message(
+            f"Zoomed to previous AOI: West={prev_west:.4f}, East={prev_east:.4f}, "
+            f"South={prev_south:.4f}, North={prev_north:.4f}"
+        )
+
+        # Update buttons based on history
+        if getattr(self, "zoom_previous_btn", None) is not None:
+            self.zoom_previous_btn.setEnabled(bool(self.aoi_past))
+        if getattr(self, "zoom_next_btn", None) is not None:
+            self.zoom_next_btn.setEnabled(bool(self.aoi_future))
+
+    def zoom_to_next(self):
+        """Zoom to the next Area of Interest (forward), if available."""
+        if not self.aoi_future:
+            self.log_message("No next Area of Interest in history")
+            return
+        # Current AOI becomes part of the 'past' stack
+        current = self._get_current_aoi()
+        if current is not None:
+            self.aoi_past.append(current)
+            if len(self.aoi_past) > 10:
+                self.aoi_past.pop(0)
+        next_west, next_east, next_south, next_north = self.aoi_future.pop()
+
+        self.west_spin.blockSignals(True)
+        self.east_spin.blockSignals(True)
+        self.south_spin.blockSignals(True)
+        self.north_spin.blockSignals(True)
+
+        self.west_spin.setValue(next_west)
+        self.east_spin.setValue(next_east)
+        self.south_spin.setValue(next_south)
+        self.north_spin.setValue(next_north)
+
+        self.west_spin.blockSignals(False)
+        self.east_spin.blockSignals(False)
+        self.south_spin.blockSignals(False)
+        self.north_spin.blockSignals(False)
+
+        self.update_map_preview()
+        self.update_estimated_pixel_count()
+        self.log_message(
+            f"Zoomed to next AOI: West={next_west:.4f}, East={next_east:.4f}, "
+            f"South={next_south:.4f}, North={next_north:.4f}"
+        )
+
+        # Update buttons based on history
+        if getattr(self, "zoom_previous_btn", None) is not None:
+            self.zoom_previous_btn.setEnabled(bool(self.aoi_past))
+        if getattr(self, "zoom_next_btn", None) is not None:
+            self.zoom_next_btn.setEnabled(bool(self.aoi_future))
 
     def calculate_overlap_from_resolution(self):
         """
@@ -1726,6 +1845,8 @@ class GMRTGrabber(QWidget):
         self.download_single_grid(params, file_name, self.on_single_download_finished, format_type)
 
     def on_rectangle_selected(self, bounds):
+        # Save current AOI before switching to the new one
+        self._push_aoi_to_history(self._get_current_aoi())
         # Block signals to prevent multiple update_map_preview calls
         self.west_spin.blockSignals(True)
         self.east_spin.blockSignals(True)
@@ -1743,7 +1864,6 @@ class GMRTGrabber(QWidget):
         self.north_spin.blockSignals(False)
 
         self.map_widget.clear_selection()
-        self.draw_rect_btn.setChecked(False)
         # Update map and pixel estimate after programmatic changes (signals were blocked)
         self.update_map_preview()  # Only one call now
         self.update_estimated_pixel_count()
@@ -1754,6 +1874,8 @@ class GMRTGrabber(QWidget):
         Zoom the map to the starting map defaults.
         """
         # Block signals to prevent multiple map updates
+        # Save current AOI before switching to defaults
+        self._push_aoi_to_history(self._get_current_aoi())
         self.west_spin.blockSignals(True)
         self.east_spin.blockSignals(True)
         self.south_spin.blockSignals(True)

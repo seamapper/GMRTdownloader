@@ -33,6 +33,10 @@ class MapWidget(QWidget):
         self.current_bounds = (west, east, south, north)
 
     def enable_drawing(self, enabled):
+        """
+        Kept for API compatibility with the main window.
+        Selection is now always enabled; toggling this just clears any existing rectangle.
+        """
         self.drawing_mode = enabled
         if not enabled:
             self.selection_rect = None
@@ -102,17 +106,24 @@ class MapWidget(QWidget):
         return (longitude, latitude)
 
     def mousePressEvent(self, event):
-        if not self.drawing_mode or self.pixmap is None or self.map_content_rect is None:
+        if self.pixmap is None or self.map_content_rect is None:
             return
-        if self.map_content_rect.contains(event.pos()):
+        if event.button() == Qt.MouseButton.LeftButton and self.map_content_rect.contains(event.pos()):
             self.drag_start = event.pos()
             self.selection_rect = QRect(self.drag_start, self.drag_start)
             self.update()
 
     def mouseMoveEvent(self, event):
         self.cursor_pos = event.pos()
+        # Update cursor shape: crosshair over the actual map content, arrow elsewhere
+        if getattr(self, "map_content_rect", None) is not None and self.map_content_rect.contains(event.pos()):
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
         self.update()
-        if not self.drawing_mode or self.drag_start is None or self.pixmap is None or self.map_content_rect is None:
+
+        if self.drag_start is None or self.pixmap is None or self.map_content_rect is None:
             return
         if not self.map_content_rect.contains(event.pos()):
             return
@@ -124,7 +135,7 @@ class MapWidget(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, event):
-        if not self.drawing_mode or self.drag_start is None or self.pixmap is None or self.map_content_rect is None:
+        if self.drag_start is None or self.pixmap is None or self.map_content_rect is None:
             return
         if event.button() == Qt.MouseButton.LeftButton:
             constrained_pos = QPoint(
@@ -161,7 +172,8 @@ class MapWidget(QWidget):
                              "Click 'Refresh Map' to load preview")
             self.image_rect = None
             self.map_content_rect = None
-        if self.drawing_mode and self.selection_rect is not None:
+        # Always draw the selection rectangle when present
+        if self.selection_rect is not None:
             pen = QPen(QColor(255, 0, 0), 2)
             painter.setPen(pen)
             painter.drawRect(self.selection_rect)
