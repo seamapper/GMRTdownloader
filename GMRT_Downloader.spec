@@ -7,20 +7,14 @@ Updated for current project structure
 import re
 from PyInstaller.utils.hooks import collect_all
 
-# Extract version from GMRT_Downloader.py (get the last uncommented version)
+# Extract version from config.py
 version = "unknown"
 try:
-    with open('GMRT_Downloader.py', 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-        # Look for the last uncommented __version__ line
-        for line in reversed(lines):
-            # Match __version__ that is not commented out (line doesn't start with #)
-            stripped = line.lstrip()
-            if not stripped.startswith('#'):
-                match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', line)
-                if match:
-                    version = match.group(1)
-                    break
+    with open('config.py', 'r', encoding='utf-8') as f:
+        for line in f:
+            match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', line)
+            if match and not line.lstrip().startswith('#'):
+                version = match.group(1)
 except Exception:
     pass
 
