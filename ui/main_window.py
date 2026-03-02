@@ -1,5 +1,6 @@
 import os
 import json
+import math
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QComboBox, QPushButton,
@@ -165,6 +166,7 @@ class GMRTGrabber(QWidget):
         self.north_spin.setRange(-85, 85)
         self.north_spin.setDecimals(6)
         self.north_spin.valueChanged.connect(self.on_coordinate_changed)
+        self.north_spin.valueChanged.connect(self.update_estimated_pixel_count)
         north_row = QHBoxLayout()
         north_row.addStretch()
         north_row.addWidget(QLabel("North"))
@@ -177,10 +179,12 @@ class GMRTGrabber(QWidget):
         self.west_spin.setRange(-180, 180)
         self.west_spin.setDecimals(6)
         self.west_spin.valueChanged.connect(self.on_coordinate_changed)
+        self.west_spin.valueChanged.connect(self.update_estimated_pixel_count)
         self.east_spin = QDoubleSpinBox()
         self.east_spin.setRange(-180, 180)
         self.east_spin.setDecimals(6)
         self.east_spin.valueChanged.connect(self.on_coordinate_changed)
+        self.east_spin.valueChanged.connect(self.update_estimated_pixel_count)
         we_row = QHBoxLayout()
         we_row.addWidget(QLabel("West"))
         we_row.addWidget(self.west_spin)
@@ -194,12 +198,18 @@ class GMRTGrabber(QWidget):
         self.south_spin.setRange(-85, 85)
         self.south_spin.setDecimals(6)
         self.south_spin.valueChanged.connect(self.on_coordinate_changed)
+        self.south_spin.valueChanged.connect(self.update_estimated_pixel_count)
         south_row = QHBoxLayout()
         south_row.addStretch()
         south_row.addWidget(QLabel("South"))
         south_row.addWidget(self.south_spin)
         south_row.addStretch()
         aoi_layout.addLayout(south_row)
+
+        # Estimated pixel count (bounds × cell resolution)
+        self.estimated_pixels_label = QLabel("Est. pixels: —")
+        self.estimated_pixels_label.setStyleSheet("color: #a0a0a0; font-size: 9pt;")
+        aoi_layout.addWidget(self.estimated_pixels_label, 0, Qt.AlignmentFlag.AlignCenter)
 
         aoi_group.setLayout(aoi_layout)
         form_layout.addRow(aoi_group)
@@ -225,6 +235,7 @@ class GMRTGrabber(QWidget):
         self.mres_combo = QComboBox()
         self.mres_combo.addItems(["100", "200", "400", "800"])
         self.mres_combo.setCurrentText("400")  # Default to 400 meters/pixel
+        self.mres_combo.currentTextChanged.connect(self.update_estimated_pixel_count)
         grid_form.addRow("Cell Resolution (meters/pixel)", self.mres_combo)
 
         # Data layer selection
@@ -368,7 +379,7 @@ class GMRTGrabber(QWidget):
         )
         credit_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         credit_label.setWordWrap(True)  # Allow text to wrap to multiple lines
-        credit_label.setStyleSheet("QLabel { color: gray; font-size: 9pt; padding: 0px; }")
+        credit_label.setStyleSheet("QLabel { color: #a0a0a0; font-size: 9pt; padding: 0px; }")
         credit_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         credit_layout.addWidget(credit_label)
         credit_group.setLayout(credit_layout)
@@ -413,7 +424,7 @@ class GMRTGrabber(QWidget):
         self.north_spin.blockSignals(False)
         # Call update_map_preview once after all values are set
         self.update_map_preview()
-        
+        self.update_estimated_pixel_count()
 
     def on_coordinate_changed(self):
         """
@@ -424,6 +435,33 @@ class GMRTGrabber(QWidget):
         # This ensures update_map_preview is only called 500ms after the user stops typing
         self.map_preview_timer.stop()
         self.map_preview_timer.start(500)  # 500ms delay
+
+    def update_estimated_pixel_count(self):
+        """Update the estimated pixel count from current bounds and cell resolution."""
+        try:
+            west = self.west_spin.value()
+            east = self.east_spin.value()
+            south = self.south_spin.value()
+            north = self.north_spin.value()
+            if east <= west or north <= south:
+                self.estimated_pixels_label.setText("Est. pixels: —")
+                return
+            cell_m = float(self.mres_combo.currentText())
+            if cell_m <= 0:
+                self.estimated_pixels_label.setText("Est. pixels: —")
+                return
+            # Approx meters per degree: lat ~111320 m/deg; lon at center lat = 111320*cos(center_lat)
+            center_lat_rad = math.radians((north + south) / 2.0)
+            m_per_deg_lon = 111320.0 * math.cos(center_lat_rad)
+            m_per_deg_lat = 111320.0
+            width_m = (east - west) * m_per_deg_lon
+            height_m = (north - south) * m_per_deg_lat
+            width_px = int(round(width_m / cell_m))
+            height_px = int(round(height_m / cell_m))
+            total = width_px * height_px
+            self.estimated_pixels_label.setText(f"Est. pixels: {width_px:,} × {height_px:,} ({total:,} total)")
+        except Exception:
+            self.estimated_pixels_label.setText("Est. pixels: —")
 
     def update_map_preview(self):
         """
@@ -1706,7 +1744,9 @@ class GMRTGrabber(QWidget):
 
         self.map_widget.clear_selection()
         self.draw_rect_btn.setChecked(False)
-        self.update_map_preview() # Only one call now
+        # Update map and pixel estimate after programmatic changes (signals were blocked)
+        self.update_map_preview()  # Only one call now
+        self.update_estimated_pixel_count()
         self.log_message(f"Rectangle selected: {bounds}")
 
     def zoom_to_default(self):
@@ -1726,6 +1766,8 @@ class GMRTGrabber(QWidget):
         self.east_spin.blockSignals(False)
         self.south_spin.blockSignals(False)
         self.north_spin.blockSignals(False)
+        # Update map and pixel estimate after programmatic changes (signals were blocked)
         self.update_map_preview()
+        self.update_estimated_pixel_count()
         self.log_message("Zoomed to starting map defaults")
 
