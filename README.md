@@ -28,7 +28,7 @@ The GMRT Bathymetry Grid Downloader provides an intuitive graphical interface fo
 
 ## Screenshots
 
-*Screenshots coming soon*
+![GMRT Bathymetry Grid Downloader](media/GMRT_Downloader.jpg)
 
 ## Installation
 
