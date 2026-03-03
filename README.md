@@ -13,10 +13,14 @@ The GMRT Bathymetry Grid Downloader provides an intuitive graphical interface fo
 ## Features
 
 - 🗺️ **Interactive Map Preview** - Visual preview of selected areas using GMRT ImageServer
+- 🎯 **Direct Map Selection** - Move the mouse over the map (crosshair cursor) and left-drag to draw a red rectangle that sets the Area of Interest; the North/West/East/South fields and estimated pixel count update automatically
 - 📥 **Multiple Output Formats** - GeoTIFF, NetCDF, and COARDS (with NetCDF mosaicing support)
 - 🎯 **Cell Resolution Selection** - Dropdown menu with preset resolutions: 100m, 200m, 400m, 800m (default: 400m)
 - 🧩 **Automatic Tiling** - Handles large downloads by automatically breaking them into manageable tiles 
 - 🔀 **Intelligent Mosaicing** - Automatically combines downloaded tiles into a final mosaic
+- 🔍 **AOI Zoom History** - *Zoom to Previous* and *Zoom to Next* buttons let you navigate up to 10 previous/next Areas of Interest
+- 🔢 **Estimated Pixel Count** - Live estimate of grid width × height (and total pixels) based on current bounds and cell resolution
+- 🌙 **Always-on Dark Mode** - Application uses a consistent dark theme regardless of the OS light/dark setting
 - 📊 **Real-time Activity Logging** - Detailed log of all operations with timestamps
 - ✅ **Coordinate Validation** - Automatic validation of geographic coordinates
 - 💾 **Session Memory** - Remembers last download directory within the same session
@@ -63,7 +67,9 @@ Download the latest release for your platform:
 
 4. **Run the application:**
    ```bash
-   python GMRT_Downloader.py
+   python GMRT_Downloader.py   # Thin launcher used by the Windows build
+   # or:
+   python main.py              # Direct entry point used during development
    ```
 
 ## Usage
@@ -72,22 +78,24 @@ Download the latest release for your platform:
 
 1. **Launch the application** (double-click executable or run from source)
 2. **Set geographic boundaries:**
-   - West (minlongitude): -180° to 180°
-   - East (maxlongitude): -180° to 180°
-   - South (minlatitude): -90° to 90°
-   - North (maxlatitude): -90° to 90°
-3. **Choose output format:** GeoTIFF, NetCDF, or COARDS
-4. **Select cell resolution:** Choose from dropdown (100m, 200m, 400m, or 800m per pixel) - default is 400m
-5. **Choose layer:** 
+   - Either type values directly into **West**, **East**, **South**, **North**
+   - Or left-drag on the map (crosshair cursor) to draw a red rectangle; the fields will update automatically
+3. **Check estimated pixel count:** Review the **Est. pixels** line under Area of Interest to understand data volume
+4. **Choose output format:** GeoTIFF, NetCDF, or COARDS
+5. **Select cell resolution:** Choose from dropdown (100m, 200m, 400m, or 800m per pixel) - default is 400m
+6. **Choose layer:** 
    - **Topo-Bathy**: Standard bathymetry and topography data
    - **Topo-Bathy (Observed Only)**: Only direct measurements, no interpolated data
-6. **Click "Refresh Map"** to preview the selected area
-7. **Click "Download Grid"** to start the download
+7. **Click "Refresh Map"** to preview the selected area
+8. **Click "Download Grid"** to start the download
 
 ### Map Preview
 
 - Use **"Refresh Map"** to load a preview of your selected area
 - Toggle **"Show High-Res Mask"** to highlight high-resolution data coverage
+- Left-drag on the map to draw a red rectangle that defines the Area of Interest
+- Use **"Zoom to Previous"** and **"Zoom to Next"** to step through up to 10 previous/next Areas of Interest
+- Use **"Zoom to Defaults"** to return to the starting global view
 - The map shows actual data availability for your coordinates
 
 ### Download Options
@@ -211,17 +219,29 @@ When using GMRT data, please cite:
 ```
 GMRTdownloader/
 │
-├── GMRT_Downloader.py          # Main application script
-├── gmrtgrab_config.json         # Configuration file
-├── GMRT_Downloader.spec         # PyInstaller spec file (Windows)
-├── build.bat                    # Windows build script
+├── GMRT_Downloader.py          # Thin launcher (entry point for builds)
+├── main.py                     # Main entry point (creates QApplication and GMRTGrabber)
+├── config.py                   # Version and API endpoint configuration
+├── converters.py               # Format conversion helpers (GeoTIFF, NetCDF, COARDS, ESRI ASCII)
+├── workers/                    # Background worker threads
+│   ├── __init__.py             # Re-exports worker classes
+│   ├── map_worker.py           # Map preview worker
+│   ├── mosaic_worker.py        # Mosaicking worker
+│   └── download_worker.py      # Grid download worker
+├── ui/                         # User-interface components
+│   ├── __init__.py             # Re-exports GMRTGrabber and MapWidget
+│   ├── main_window.py          # GMRTGrabber main window
+│   └── map_widget.py           # Interactive map widget (selection, crosshair, coordinates)
+├── gmrtgrab_config.json        # Configuration file (e.g., last download directory)
+├── GMRT_Downloader.spec        # PyInstaller spec file (Windows)
+├── build.bat                   # Windows build script
 │
 ├── media/
-│   ├── GMRT-logo2020.ico        # Application icon
-│   └── GMRT-logo2020.png        # Icon source file
+│   ├── GMRT-logo2020.ico       # Application icon
+│   └── GMRT-logo2020.png       # Icon source file
 │
-├── README.md                    # This file
-├── GMRT_DOWNLOADER_README.md    # Detailed usage documentation
+├── README.md                   # This file
+├── GMRT_DOWNLOADER_README.md   # Detailed usage documentation
 ├── WINDOWS_EXE_BUILD_INSTRUCTIONS.md  # Windows build guide
 └── MAC_APP_BUILD_INSTRUCTIONS.md      # macOS build guide
 ```
@@ -238,10 +258,14 @@ Contributions are welcome! Please feel free to submit a Pull Request. For major 
 
 ## Version History
 
-- **v2025.06** - Streamlined download process and UI improvements
-  - Major change to streamline the download process by removing tiling options
-  - Reduced padding in Credit box for more compact UI
-  - Improved overall UI spacing and layout
+- **v2026.01** - Version bump; codebase uses modular structure (main.py, config.py, ui/, workers/, converters.py) with GMRT_Downloader.py as launcher for builds
+- **v2025.06** - UI refactor, dark mode, and AOI improvements
+  - Refactored monolithic script into modules (`main.py`, `config.py`, `ui/`, `workers/`, `converters.py`) while keeping the `GMRT_Downloader.py` launcher for builds
+  - Forced Fusion-based dark theme so the app is always dark regardless of OS theme
+  - Reworked Area of Interest UI into a North/West/East/South “+” layout with live estimated pixel count
+  - Enabled direct map-based AOI selection via left-drag (red rectangle) with crosshair cursor and coordinate readout
+  - Added AOI zoom history: Zoom to Previous / Zoom to Next (up to 10 levels) and Zoom to Defaults
+  - Reduced padding in Credit box for more compact UI and improved overall spacing and layout
 - **v2025.05** - Major UI and functionality improvements
   - Changed Cell Resolution to dropdown menu (100m, 200m, 400m, 800m)
   - Removed Data Resolution option (always use Cell Resolution)

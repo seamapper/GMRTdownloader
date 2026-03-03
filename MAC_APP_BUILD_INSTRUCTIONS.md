@@ -42,6 +42,10 @@ pip install rasterio  # Optional but recommended
 pip install netCDF4   # Optional but recommended
 ```
 
+### Project structure (for building)
+
+The app uses a modular layout. The build entry point is `GMRT_Downloader.py` (a thin launcher that calls `main.main()`). The real application lives in `main.py`, `config.py`, and the packages `ui/`, `workers/`, and `converters.py`. The **version** used for the app bundle (e.g. in Info.plist) should match `__version__` in `config.py`. The icon is `media/GMRT-logo2020.icns` (convert from `.ico` or `.png` if needed; see [Creating an Icon File](#creating-an-icon-file)).
+
 ### Optional: Install Homebrew
 
 If you don't have Homebrew installed:
@@ -70,27 +74,39 @@ Create a file named `setup.py` in your project directory with the following cont
 Setup script for creating a Mac app bundle using py2app
 """
 
+import re
 from setuptools import setup
 
-APP = ['GMRT_Downloader.py']
+# Read version from config.py to keep in sync with the app
+version = "unknown"
+try:
+    with open('config.py', 'r', encoding='utf-8') as f:
+        for line in f:
+            match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', line)
+            if match and not line.lstrip().startswith('#'):
+                version = match.group(1)
+except Exception:
+    pass
+
+APP = ['GMRT_Downloader.py']  # Entry-point launcher (imports main.py, ui/, workers/)
 DATA_FILES = [
     ('media', ['media/GMRT-logo2020.ico', 'media/GMRT-logo2020.png']),
     ('', ['gmrtgrab_config.json']),
 ]
 OPTIONS = {
     'argv_emulation': True,
-    'iconfile': 'media/GMRT-logo2020.icns',  # You'll need to convert .ico or .png to .icns (see Icon section)
+    'iconfile': 'media/GMRT-logo2020.icns',  # Convert .ico or .png to .icns (see Icon section)
     'plist': {
         'CFBundleName': 'GMRT Downloader',
         'CFBundleDisplayName': 'GMRT Bathymetry Grid Downloader',
-        'CFBundleGetInfoString': 'GMRT Bathymetry Grid Downloader v2025.06',
+        'CFBundleGetInfoString': f'GMRT Bathymetry Grid Downloader v{version}',
         'CFBundleIdentifier': 'org.gmrt.downloader',
-        'CFBundleVersion': '2025.06',
-        'CFBundleShortVersionString': '2025.06',
+        'CFBundleVersion': version,
+        'CFBundleShortVersionString': version,
         'NSHighResolutionCapable': True,
         'NSRequiresAquaSystemAppearance': False,
         'LSMinimumSystemVersion': '10.13',
-        'NSHumanReadableCopyright': 'Copyright © 2025 Paul Johnson',
+        'NSHumanReadableCopyright': 'Copyright © 2026 Paul Johnson',
         'NSAppTransportSecurity': {
             'NSAllowsArbitraryLoads': True  # Required for GMRT API calls
         }
@@ -110,6 +126,8 @@ OPTIONS = {
         'math',
     ],
     'packages': [
+        'ui',
+        'workers',
         'rasterio',
         'netCDF4',
     ],
@@ -187,7 +205,19 @@ Create a file named `GMRT_Downloader_Mac.spec`:
 
 ```python
 # -*- mode: python ; coding: utf-8 -*-
+import re
 from PyInstaller.utils.hooks import collect_all
+
+# Extract version from config.py
+version = "unknown"
+try:
+    with open('config.py', 'r', encoding='utf-8') as f:
+        for line in f:
+            match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', line)
+            if match and not line.lstrip().startswith('#'):
+                version = match.group(1)
+except Exception:
+    pass
 
 datas = [
     ('media', 'media'),
@@ -221,11 +251,11 @@ try:
     datas += tmp_ret[0]
     binaries += tmp_ret[1]
     hiddenimports += tmp_ret[2]
-except:
+except Exception:
     pass
 
 a = Analysis(
-    ['GMRT_Downloader.py'],
+    ['GMRT_Downloader.py'],  # Entry-point launcher (imports main.py, ui/, workers/)
     pathex=[],
     binaries=binaries,
     datas=datas,
@@ -271,9 +301,9 @@ app = BUNDLE(
         'LSMinimumSystemVersion': '10.13',
         'CFBundleName': 'GMRT Downloader',
         'CFBundleDisplayName': 'GMRT Bathymetry Grid Downloader',
-        'CFBundleVersion': '2025.06',
-        'CFBundleShortVersionString': '2025.06',
-        'NSHumanReadableCopyright': 'Copyright © 2025 Paul Johnson',
+        'CFBundleVersion': version,
+        'CFBundleShortVersionString': version,
+        'NSHumanReadableCopyright': 'Copyright © 2026 Paul Johnson',
         'NSAppTransportSecurity': {
             'NSAllowsArbitraryLoads': True
         }
@@ -604,11 +634,12 @@ This will show any error messages in the terminal.
 
 ## Version History
 
+- **2026.01** - Version read from `config.py`; entry point `GMRT_Downloader.py` (launcher); project layout: `main.py`, `config.py`, `ui/`, `workers/`, `converters.py`; py2app/PyInstaller include `ui` and `workers` packages
 - **2025.06** - Updated for v2025.06, corrected icon paths to GMRT-logo2020.ico/png/icns
 - **2025.05** - Initial Mac app build instructions
 
 ---
 
 **Author:** Paul Johnson  
-**Last Updated:** July 2025
+**Last Updated:** March 2026
 

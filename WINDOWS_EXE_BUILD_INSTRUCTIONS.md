@@ -39,6 +39,10 @@ pip install rasterio  # Optional but recommended for GeoTIFF support
 pip install netCDF4   # Optional but recommended for NetCDF support
 ```
 
+### Project structure (for building)
+
+The app uses a modular layout. The PyInstaller entry point is `GMRT_Downloader.py` (a thin launcher that calls `main.main()`). The real application lives in `main.py`, `config.py`, and the packages `ui/`, `workers/`, and `converters.py`. The **version** used for the executable name is read from `config.py` (`__version__`). The icon is `media\GMRT-logo2020.ico`.
+
 ### Optional: Install Microsoft Visual C++ Redistributable
 
 Some Python packages (like numpy) may require the Visual C++ Redistributable. Download and install from:
@@ -70,20 +74,14 @@ Updated for current project structure
 import re
 from PyInstaller.utils.hooks import collect_all
 
-# Extract version from GMRT_Downloader.py (get the last uncommented version)
+# Extract version from config.py
 version = "unknown"
 try:
-    with open('GMRT_Downloader.py', 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-        # Look for the last uncommented __version__ line
-        for line in reversed(lines):
-            # Match __version__ that is not commented out (line doesn't start with #)
-            stripped = line.lstrip()
-            if not stripped.startswith('#'):
-                match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', line)
-                if match:
-                    version = match.group(1)
-                    break
+    with open('config.py', 'r', encoding='utf-8') as f:
+        for line in f:
+            match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', line)
+            if match and not line.lstrip().startswith('#'):
+                version = match.group(1)
 except Exception:
     pass
 
@@ -126,7 +124,7 @@ except:
     pass
 
 a = Analysis(
-    ['GMRT_Downloader.py'],  # Main script
+    ['GMRT_Downloader.py'],  # Entry-point launcher (imports main.py, which loads ui/ and workers/)
     pathex=[],                # Additional paths to search
     binaries=binaries,
     datas=datas,
@@ -173,7 +171,7 @@ pyinstaller GMRT_Downloader.spec
 ```
 
 This creates:
-- `dist/GMRT_Bathymetry_Downloader_v{version}.exe` - The executable file (version extracted from GMRT_Downloader.py)
+- `dist/GMRT_Bathymetry_Downloader_v{version}.exe` - The executable file (version extracted from config.py)
 - `build/` - Temporary build files (can be deleted)
 
 #### Option B: Using Command Line (Quick Test)
@@ -190,7 +188,7 @@ pyinstaller --onefile --windowed --name="GMRT_Bathymetry_Downloader" --icon=medi
 - `--name` - Name of the output executable
 - `--icon` - Path to icon file
 - `--add-data` - Include data files (format: `source;destination`)
-- `GMRT_Downloader.py` - Main script
+- `GMRT_Downloader.py` - Entry-point launcher (used by PyInstaller; imports `main.py`)
 
 ### Step 4: Test the Executable
 
@@ -198,7 +196,7 @@ pyinstaller --onefile --windowed --name="GMRT_Bathymetry_Downloader" --icon=medi
 # Navigate to dist folder
 cd dist
 
-# Run the executable (replace {version} with actual version, e.g., v2025.06)
+# Run the executable (replace {version} with actual version, e.g., v2026.01)
 .\GMRT_Bathymetry_Downloader_v{version}.exe
 ```
 
@@ -268,7 +266,7 @@ exe = Executable(
 
 setup(
     name='GMRT Bathymetry Grid Downloader',
-    version='2025.05',
+    version='2026.01',
     description='GMRT Bathymetry Grid Downloader',
     options={'build_exe': build_exe_options},
     executables=[exe],
@@ -388,7 +386,7 @@ coll = COLLECT(
 For distribution, create a ZIP file:
 
 ```powershell
-# Using PowerShell (replace {version} with actual version, e.g., v2025.06)
+# Using PowerShell (replace {version} with actual version, e.g., v2026.01)
 Compress-Archive -Path dist\GMRT_Bathymetry_Downloader_v*.exe -DestinationPath GMRT_Downloader_v{version}.zip
 ```
 
@@ -659,11 +657,12 @@ build.bat
 
 ## Version History
 
+- **2026.01** - Version read from `config.py`; entry point remains `GMRT_Downloader.py` (launcher); project layout: `main.py`, `config.py`, `ui/`, `workers/`, `converters.py`
 - **2025.06** - Updated for v2025.06, corrected icon path to GMRT-logo2020.ico, updated executable naming to include version
 - **2025.05** - Initial Windows .exe build instructions
 
 ---
 
 **Author:** Paul Johnson  
-**Last Updated:** July 2025
+**Last Updated:** March 2026
 
