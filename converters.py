@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Paul Johnson
+# SPDX-License-Identifier: MIT
+
 """
 Format conversion functions for GMRT bathymetry data (GeoTIFF, NetCDF, COARDS, ESRI ASCII).
 """

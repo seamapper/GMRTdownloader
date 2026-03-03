@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Paul Johnson
+# SPDX-License-Identifier: MIT
+
 import os
 import json
 import math

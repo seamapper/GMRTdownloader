@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Paul Johnson
+# SPDX-License-Identifier: MIT
+
 """
 GMRT Bathymetry Grid Downloader - Launcher
 
@@ -12,7 +15,7 @@ R.A. Weissel, V. Ferrini, A. Goodwillie, F. Nitsche, J. Bonczkowski, and R. Zems
 Global Multi-Resolution Topography synthesis, Geochem. Geophys. Geosyst., 10, Q03014,
 doi: 10.1029/2008GC002332
 
-Author: Paul Johnson
+Author: Paul Johnson, Center for Coastal and Ocean Mapping, University of New Hampshire
 """
 
 from main import main

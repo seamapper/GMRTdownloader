@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Paul Johnson
+# SPDX-License-Identifier: MIT
+
 """
 Worker thread for loading map preview images from GMRT ImageServer.
 """

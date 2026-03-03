@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Paul Johnson
+# SPDX-License-Identifier: MIT
+
 """
 Custom widget for displaying map with rectangle drawing and coordinate display.
 """
