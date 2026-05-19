@@ -133,9 +133,10 @@ build.bat
 
 See [MAC_APP_BUILD_INSTRUCTIONS.md](MAC_APP_BUILD_INSTRUCTIONS.md) for detailed instructions.
 
-**Quick build with py2app:**
+**Quick build with py2app (macOS):** use a clean venv **without PyInstaller**; Python 3.11 or 3.12 recommended.
+
 ```bash
-pip install py2app
+pip install py2app PyQt6 requests numpy
 python setup.py py2app
 ```
 
@@ -233,6 +234,7 @@ GMRTdownloader/
 │   ├── main_window.py          # GMRTGrabber main window
 │   └── map_widget.py           # Interactive map widget (selection, crosshair, coordinates)
 ├── gmrtgrab_config.json        # Configuration file (e.g., last download directory)
+├── setup.py                    # py2app Mac build (do not install PyInstaller in build venv)
 ├── GMRT_Downloader.spec        # PyInstaller spec file (Windows)
 ├── build.bat                   # Windows build script
 │

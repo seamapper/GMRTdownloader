@@ -59,96 +59,29 @@ If you don't have Homebrew installed:
 
 `py2app` is specifically designed for creating Mac applications and produces cleaner, more native-looking app bundles.
 
-### Step 1: Install py2app
+### Step 1: Create a clean build environment
+
+Use a **dedicated virtual environment** for the Mac build. **Do not install PyInstaller** in this venv — if it is present, py2app's dependency scanner tries to import `PyInstaller.hooks.hook-PyQt5.*` / `hook-PySide6.*` and fails (those names are not valid Python modules).
+
+**Recommended:** Python **3.11** or **3.12** (py2app and some dependencies may not support 3.14 yet).
 
 ```bash
-pip install py2app
+cd GMRTdownloader-master   # or your clone directory
+python3.12 -m venv venv-mac-build
+source venv-mac-build/bin/activate
+pip install --upgrade pip
+pip install py2app PyQt6 requests numpy
+pip install rasterio netCDF4   # optional but recommended
 ```
 
-### Step 2: Create setup.py
+### Step 2: Use the project `setup.py`
 
-Create a file named `setup.py` in your project directory with the following content:
+The repository includes `setup.py` at the project root (configured for py2app with PyInstaller and other Qt bindings excluded). You do not need to create your own.
 
-```python
-"""
-Setup script for creating a Mac app bundle using py2app
-"""
+If you previously installed PyInstaller in this venv, remove it before building:
 
-import re
-from setuptools import setup
-
-# Read version from config.py to keep in sync with the app
-version = "unknown"
-try:
-    with open('config.py', 'r', encoding='utf-8') as f:
-        for line in f:
-            match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', line)
-            if match and not line.lstrip().startswith('#'):
-                version = match.group(1)
-except Exception:
-    pass
-
-APP = ['GMRT_Downloader.py']  # Entry-point launcher (imports main.py, ui/, workers/)
-DATA_FILES = [
-    ('media', [
-        'media/GMRT-logo2020.ico',
-        'media/GMRT-logo2020.png',
-        'media/GMRT-logo2020.icns',
-    ]),
-    ('', ['gmrtgrab_config.json']),
-]
-OPTIONS = {
-    'argv_emulation': True,
-    'iconfile': 'media/GMRT-logo2020.icns',
-    'plist': {
-        'CFBundleName': 'GMRT Downloader',
-        'CFBundleDisplayName': 'GMRT Bathymetry Grid Downloader',
-        'CFBundleGetInfoString': f'GMRT Bathymetry Grid Downloader v{version}',
-        'CFBundleIdentifier': 'org.gmrt.downloader',
-        'CFBundleVersion': version,
-        'CFBundleShortVersionString': version,
-        'NSHighResolutionCapable': True,
-        'NSRequiresAquaSystemAppearance': False,
-        'LSMinimumSystemVersion': '10.13',
-        'NSHumanReadableCopyright': 'Copyright © 2026 Paul Johnson',
-        'NSAppTransportSecurity': {
-            'NSAllowsArbitraryLoads': True  # Required for GMRT API calls
-        }
-    },
-    'includes': [
-        'PyQt6.QtCore',
-        'PyQt6.QtGui',
-        'PyQt6.QtWidgets',
-        'requests',
-        'json',
-        'datetime',
-        'time',
-        'os',
-        'sys',
-        'numpy',
-        'shutil',
-        'math',
-    ],
-    'packages': [
-        'ui',
-        'workers',
-        'rasterio',
-        'netCDF4',
-    ],
-    'excludes': [
-        'matplotlib',
-        'scipy',
-        'pandas',
-    ],
-}
-
-setup(
-    name='GMRT Downloader',
-    app=APP,
-    data_files=DATA_FILES,
-    options={'py2app': OPTIONS},
-    setup_requires=['py2app'],
-)
+```bash
+pip uninstall -y pyinstaller pyinstaller-hooks-contrib
 ```
 
 ### Step 3: Build the App
@@ -567,7 +500,28 @@ Or if distributing via download, make sure the app is properly code signed.
 - Use `--debug=all` with PyInstaller to see what's missing
 - Test imports in a clean Python environment
 
-#### 3. PyQt5 hook error (`hook-PyQt5.QtSql`)
+#### 3. py2app: `No module named PyInstaller.hooks.hook-PyQt5...` or `hook-PySide6...`
+
+**Problem:** Build fails during `running py2app` / `detect_dunder_file` with:
+
+```text
+ImportError: No module named PyInstaller.hooks.hook-PyQt5.QtChart
+```
+
+(or similar `hook-PySide6.Qt3DLogic`, etc.)
+
+**Cause:** **PyInstaller is installed** in the same venv. py2app scans installed packages and tries to import all of `PyInstaller.hooks`; hook file names contain hyphens and are not importable as Python modules.
+
+**Solution:**
+
+1. Use a **build-only venv** without PyInstaller (see [Step 1](#step-1-create-a-clean-build-environment)).
+2. `pip uninstall -y pyinstaller pyinstaller-hooks-contrib`
+3. Pull the latest `setup.py` from the repo (it excludes `PyInstaller` and other Qt bindings).
+4. Rebuild: `python setup.py py2app`
+
+The `DeprecatedInstaller: fetch_build_eggs` warning is harmless for now; the repo `setup.py` no longer uses `setup_requires=['py2app']` — install py2app with `pip` first.
+
+#### 4. PyQt5 hook error (`hook-PyQt5.QtSql`) — PyInstaller only
 
 **Problem:** Build fails during analysis with:
 
@@ -607,7 +561,7 @@ ImportError: No module named PyInstaller.hooks.hook-PyQt5.QtSql
 
 If problems persist, use **py2app** ([Method 1](#method-1-using-py2app-recommended-for-mac)) instead of PyInstaller; it does not use the PyQt5 hook chain.
 
-#### 4. PyQt6 Issues
+#### 5. PyQt6 Issues
 
 **Problem:** PyQt6 plugins not loading.
 
@@ -624,7 +578,7 @@ if getattr(sys, 'frozen', False):
     ])
 ```
 
-#### 5. Large App Size
+#### 6. Large App Size
 
 **Problem:** App bundle is very large (>200MB).
 
@@ -633,13 +587,13 @@ if getattr(sys, 'frozen', False):
 - Strip unnecessary binaries
 - Use UPX compression (PyInstaller) - but test thoroughly
 
-#### 6. Network Requests Failing
+#### 7. Network Requests Failing
 
 **Problem:** App can't connect to GMRT servers.
 
 **Solution:** Ensure `NSAppTransportSecurity` is set in Info.plist (see setup.py example above).
 
-#### 7. Console Window Appears
+#### 8. Console Window Appears
 
 **Problem:** Console window shows when running the app.
 
@@ -683,10 +637,10 @@ This will show any error messages in the terminal.
 
 ## Quick Start Checklist
 
-- [ ] Install Python 3.8+ and required packages
-- [ ] Install py2app or PyInstaller
+- [ ] Create clean build venv (Python 3.11 or 3.12; **no PyInstaller**)
+- [ ] `pip install py2app PyQt6 requests numpy` (+ rasterio/netCDF4 if needed)
 - [ ] Confirm `media/GMRT-logo2020.icns` exists (included in repo; run `python media/convert_icon.py` only if you changed the PNG)
-- [ ] Create setup.py or .spec file
+- [ ] Use repo `setup.py` (or Mac `.spec` for PyInstaller)
 - [ ] Build the app
 - [ ] Test the app locally
 - [ ] Code sign the app (for distribution)
@@ -705,7 +659,7 @@ This will show any error messages in the terminal.
 
 ## Version History
 
-- **2026.02** - `GMRT-logo2020.icns` committed in `media/`; `convert_icon.py` builds `.ico` and `.icns` from PNG; PyInstaller Mac spec excludes PyQt5/PySide; troubleshooting for `hook-PyQt5.QtSql` error
+- **2026.02** - Added repo `setup.py` for py2app (excludes PyInstaller); Mac build venv must not include PyInstaller; troubleshooting for py2app `hook-PyQt5` / `hook-PySide6` errors; `GMRT-logo2020.icns` in `media/`
 - **2026.01** - Version read from `config.py`; entry point `GMRT_Downloader.py` (launcher); project layout: `main.py`, `config.py`, `ui/`, `workers/`, `converters.py`; py2app/PyInstaller include `ui` and `workers` packages
 - **2025.06** - Updated for v2025.06, corrected icon paths to GMRT-logo2020.ico/png/icns
 - **2025.05** - Initial Mac app build instructions
