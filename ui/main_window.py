@@ -6,7 +6,7 @@ import json
 import math
 from datetime import datetime
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QLineEdit, QComboBox, QPushButton,
+    QApplication, QWidget, QLabel, QLineEdit, QPushButton,
     QVBoxLayout, QHBoxLayout, QFileDialog, QMessageBox, QDoubleSpinBox,
     QGroupBox, QFormLayout, QCheckBox, QTextEdit, QSplitter, QFrame, QSizePolicy
 )
@@ -20,13 +20,52 @@ except ImportError:
 
 from config import (
     __version__,
+    GMRT_LOG_FILENAME,
     MAP_PREVIEW_MAX_RETRIES,
     MAP_PREVIEW_RETRY_DELAY_MS,
     MAP_PREVIEW_WATCHDOG_MS,
+    TILE_DOWNLOAD_MAX_RETRIES,
+    TILE_DOWNLOAD_RETRY_DELAY_MS,
+    TILE_DOWNLOAD_INTER_TILE_DELAY_MS,
+    TILE_DOWNLOAD_WATCHDOG_MS,
+    tile_size_degrees_for_mres,
+    needs_tiling_for_spans,
+    build_degree_strips,
+    format_gmrt_grid_request_url,
+    init_gmrt_log_session,
 )
 from workers import MapWorker, MosaicWorker, DownloadWorker
 from converters import convert_geotiff_to_netcdf, convert_geotiff_to_coards
 from ui.map_widget import MapWidget
+from ui.form_selector import FormSelector
+from ui.download_progress_dialog import DownloadProgressDialog
+
+# Activity log colors (dark theme)
+_LOG_COLOR_NORMAL = "#e0e0e0"
+_LOG_COLOR_PROBLEM = "#ff9f43"
+
+# Substrings that mark a problem line in the activity log (case-insensitive)
+_LOG_PROBLEM_MARKERS = (
+    "error",
+    "failed",
+    "failure",
+    "timeout",
+    "timed out",
+    "invalid",
+    "✗",
+    "no data returned",
+    "connection error",
+    "request too large",
+    "retries exhausted",
+    "critical error",
+    "could not",
+    "not available",
+    "missing or unreadable",
+    "skipping",
+    "empty response",
+    "empty image",
+    "watchdog",
+)
 
 
 def _project_root():
@@ -87,6 +126,12 @@ class GMRTGrabber(QWidget):
         # Worker threads for background operations
         self.current_worker = None         # Current download worker
         self.current_map_worker = None     # Current map preview worker
+        self.download_progress = None      # Progress dialog during download/mosaic
+        self._download_progress_mode = None  # 'single', 'tiles', or 'mosaic'
+        self._tile_retry_count = 0         # retries for the current tile (tiled downloads)
+        self.tile_download_watchdog = QTimer()
+        self.tile_download_watchdog.setSingleShot(True)
+        self.tile_download_watchdog.timeout.connect(self._on_tile_download_watchdog)
         # Initialize the user interface
         self.init_ui()
         # Set default window size
@@ -133,20 +178,6 @@ class GMRTGrabber(QWidget):
             "Topo-Bathy (Observed Only)": "topo-mask"
         }
         return layer_mapping.get(display_text, display_text)
-
-    @staticmethod
-    def _configure_combo_box(combo: QComboBox) -> None:
-        """Consistent combo setup; avoids macOS popup/focus issues with dark Fusion."""
-        combo.setEditable(False)
-        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        combo.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
-        )
-        combo.setMinimumContentsLength(8)
-        combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        view = combo.view()
-        if view is not None:
-            view.setMinimumWidth(140)
 
     def save_last_download_dir(self, directory):
         """
@@ -243,6 +274,7 @@ class GMRTGrabber(QWidget):
 
         # Estimated pixel count (bounds × cell resolution)
         self.estimated_pixels_label = QLabel("Est. pixels: —")
+        self.estimated_pixels_label.setWordWrap(True)
         self.estimated_pixels_label.setStyleSheet("color: #a0a0a0; font-size: 9pt;")
         aoi_layout.addWidget(self.estimated_pixels_label, 0, Qt.AlignmentFlag.AlignCenter)
 
@@ -257,32 +289,29 @@ class GMRTGrabber(QWidget):
         
         # Output format selection
         # Different formats are suitable for different applications
-        self.format_combo = QComboBox()
+        self.format_combo = FormSelector()
         self.format_combo.addItems([
             "GeoTIFF",           # GeoTIFF - Raster format with embedded georeference
             "NetCDF",            # NetCDF - Scientific data format with metadata
             "NetCDF (COARDS)"    # COARDS - NetCDF convention for oceanographic/atmospheric data
         ])
-        self._configure_combo_box(self.format_combo)
         grid_form.addRow("Output Format", self.format_combo)
 
         # Cell resolution selection
         # Allows users to specify meter-per-pixel resolution
-        self.mres_combo = QComboBox()
+        self.mres_combo = FormSelector()
         self.mres_combo.addItems(["60", "120", "240", "480", "960"])
-        self._configure_combo_box(self.mres_combo)
-        self.mres_combo.setCurrentIndex(3)  # 480 m/pixel (index, not setCurrentText — macOS-safe)
+        self.mres_combo.setCurrentIndex(3)  # 480 m/pixel
         self.mres_combo.currentIndexChanged.connect(self._on_mres_changed)
         grid_form.addRow("Cell Resolution (meters/pixel)", self.mres_combo)
 
         # Data layer selection
         # Different layers provide different types of bathymetry data
-        self.layer_combo = QComboBox()
+        self.layer_combo = FormSelector()
         self.layer_combo.addItems([
             "Topo-Bathy",                    # Topography - Standard bathymetry data
             "Topo-Bathy (Observed Only)"     # Topography with mask - High-resolution data only
         ])
-        self._configure_combo_box(self.layer_combo)
         grid_form.addRow("GMRT Source", self.layer_combo)
 
         # Split Bathymetry/Topography option
@@ -355,6 +384,9 @@ class GMRTGrabber(QWidget):
         self.log_area.setMinimumHeight(100)  # Set minimum height for usability
         self.log_area.setReadOnly(True)      # Users can't edit the log
         self.log_area.setFont(QApplication.font())  # Use system font
+        self.log_area.setStyleSheet(
+            f"QTextEdit {{ color: {_LOG_COLOR_NORMAL}; background-color: #2d2d2d; }}"
+        )
         log_layout.addWidget(self.log_area)
         
         # Clear log button - allows users to reset the log
@@ -510,7 +542,22 @@ class GMRTGrabber(QWidget):
             width_px = int(round(width_m / cell_m))
             height_px = int(round(height_m / cell_m))
             total = width_px * height_px
-            self.estimated_pixels_label.setText(f"Est. pixels: {width_px:,} × {height_px:,} ({total:,} total)")
+            lon_span = east - west
+            lat_span = north - south
+            tile_size = tile_size_degrees_for_mres(cell_m)
+            if needs_tiling_for_spans(lon_span, lat_span, cell_m):
+                overlap = self.calculate_overlap_from_resolution()
+                n_lon = len(build_degree_strips(west, east, tile_size, overlap))
+                n_lat = len(build_degree_strips(south, north, tile_size, overlap))
+                n_tiles = n_lon * n_lat
+                tile_part = (
+                    f"  ·  Tiles: {n_lon}×{n_lat} ({n_tiles} total) @ {tile_size:g}°"
+                )
+            else:
+                tile_part = f"  ·  Single download ({tile_size:g}° tile)"
+            self.estimated_pixels_label.setText(
+                f"Est. pixels: {width_px:,} × {height_px:,} ({total:,} total){tile_part}"
+            )
         except Exception:
             self.estimated_pixels_label.setText("Est. pixels: —")
 
@@ -716,11 +763,28 @@ class GMRTGrabber(QWidget):
             )
             self.map_widget.set_pixmap(scaled_pixmap)
 
-    def log_message(self, message):
-        """Add a message to the log with timestamp"""
+    @staticmethod
+    def _escape_log_html(text: str) -> str:
+        return (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    @classmethod
+    def _is_problem_log_message(cls, message: str) -> bool:
+        lower = message.lower()
+        return any(marker in lower for marker in _LOG_PROBLEM_MARKERS)
+
+    def log_message(self, message, *, problem: bool | None = None):
+        """Add a message to the log with timestamp; problems are shown in orange."""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        log_entry = f"[{timestamp}] {message}"
-        self.log_area.append(log_entry)
+        is_problem = self._is_problem_log_message(message) if problem is None else problem
+        color = _LOG_COLOR_PROBLEM if is_problem else _LOG_COLOR_NORMAL
+        safe_message = self._escape_log_html(message)
+        self.log_area.append(
+            f'<span style="color:{color};">[{timestamp}] {safe_message}</span>'
+        )
         # Auto-scroll to bottom
         scrollbar = self.log_area.verticalScrollBar()
         if scrollbar:
@@ -730,6 +794,28 @@ class GMRTGrabber(QWidget):
         """Clear the log area"""
         self.log_area.clear()
         self.log_message("Log cleared")
+
+    def _tile_download_counts(self) -> tuple[int, int, int]:
+        """Return (expected, successful, failed) tile counts for the current run."""
+        expected = len(self.tiles_to_download)
+        successful = getattr(self, "success_count", 0)
+        failed = max(0, expected - successful)
+        return expected, successful, failed
+
+    def _all_tiles_downloaded(self) -> bool:
+        expected, successful, _ = self._tile_download_counts()
+        return expected > 0 and successful >= expected
+
+    def _log_incomplete_tiles_error(self, context: str = "") -> None:
+        """Log an error when one or more tiles failed to download."""
+        expected, successful, failed = self._tile_download_counts()
+        if failed <= 0:
+            return
+        prefix = f"{context}: " if context else ""
+        self.log_message(
+            f"{prefix}Not all tiles were downloaded — {successful}/{expected} succeeded, "
+            f"{failed} failed. The result may contain gaps."
+        )
 
     def _get_current_aoi(self):
         """Return current Area of Interest as (west, east, south, north)."""
@@ -887,47 +973,15 @@ class GMRTGrabber(QWidget):
         if overlap is None:
             overlap = self.calculate_overlap_from_resolution()
             self.log_message(f"Auto-calculated overlap: {overlap:.6f} degrees (2 cells at {self.mres_combo.currentText()}m resolution)")
-        
-        # Tile size is always 2.0 degrees
-        tile_size = 2.0
-        
-        # Generate longitude tiles (without overlap applied yet)
-        lon_tiles = []
-        current_lon = west
-        iteration = 0
-        
-        while current_lon < east and iteration < 10:  # Safety limit
-            tile_west = current_lon
-            tile_east = min(current_lon + tile_size, east)
-            
-            # Only add tile if it has meaningful size (at least 0.1 degrees)
-            if tile_east - tile_west >= 0.1:
-                lon_tiles.append((tile_west, tile_east))
-                # Move to next tile position (account for overlap)
-                current_lon = tile_east - overlap
-            else:
-                break  # Exit the loop for tiny tiles
-            
-            iteration += 1
-        
-        # Generate latitude tiles (without overlap applied yet)
-        lat_tiles = []
-        current_lat = south
-        iteration = 0
-        
-        while current_lat < north and iteration < 10:  # Safety limit
-            tile_south = current_lat
-            tile_north = min(current_lat + tile_size, north)
-            
-            # Only add tile if it has meaningful size (at least 0.1 degrees)
-            if tile_north - tile_south >= 0.1:
-                lat_tiles.append((tile_south, tile_north))
-                # Move to next tile position (account for overlap)
-                current_lat = tile_north - overlap
-            else:
-                break  # Exit the loop for tiny tiles
-            
-            iteration += 1
+
+        mres_value = float(self.mres_combo.currentText())
+        tile_size = tile_size_degrees_for_mres(mres_value)
+        self.log_message(
+            f"Tile size at {mres_value:.0f} m resolution: {tile_size:g}° × {tile_size:g}°"
+        )
+
+        lon_tiles = build_degree_strips(west, east, tile_size, overlap)
+        lat_tiles = build_degree_strips(south, north, tile_size, overlap)
         
         # Generate all tile combinations with automatic overlap on all sides
         # Overlap is applied per-tile, respecting geographic boundaries
@@ -966,6 +1020,99 @@ class GMRTGrabber(QWidget):
         
         return tiles
 
+    def _open_download_progress(self, title: str, message: str = "", maximum: int = 100) -> None:
+        if self.download_progress is None:
+            self.download_progress = DownloadProgressDialog(self)
+        self.download_progress.begin(title, message, maximum)
+
+    def _update_download_progress(
+        self,
+        value: int | None = None,
+        message: str | None = None,
+        *,
+        maximum: int | None = None,
+        indeterminate: bool = False,
+    ) -> None:
+        if self.download_progress is not None:
+            self.download_progress.update_progress(
+                value, message, maximum=maximum, indeterminate=indeterminate
+            )
+
+    def _close_download_progress(self) -> None:
+        if self.download_progress is not None:
+            self.download_progress.close()
+            self.download_progress = None
+        self._download_progress_mode = None
+
+    def _disconnect_download_worker_signals(self) -> None:
+        worker = self.current_worker
+        if worker is None:
+            return
+        try:
+            worker.progress.disconnect(self._on_download_byte_progress)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            worker.finished.disconnect(self.on_tile_download_finished)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            worker.finished.disconnect(self.on_single_download_finished)
+        except (TypeError, RuntimeError):
+            pass
+
+    def _stop_tile_download_watchdog(self) -> None:
+        self.tile_download_watchdog.stop()
+
+    def _start_tile_download_watchdog(self) -> None:
+        self._stop_tile_download_watchdog()
+        self.tile_download_watchdog.start(TILE_DOWNLOAD_WATCHDOG_MS)
+
+    def _on_tile_download_watchdog(self) -> None:
+        """Abort a tile download that has not finished within the watchdog window."""
+        worker = self.current_worker
+        if worker is None or not worker.isRunning():
+            return
+        self.log_message("Tile download watchdog: request exceeded time limit")
+        self._disconnect_download_worker_signals()
+        worker.terminate()
+        worker.wait(3000)
+        self.current_worker = None
+        self.on_tile_download_finished(
+            False, "Request Timeout - The server took too long to respond"
+        )
+
+    def _on_download_byte_progress(self, received: int, total: int) -> None:
+        if self.download_progress is None:
+            return
+        if received > 0 and self.download_progress.progress_bar.maximum() == 0:
+            self.download_progress.progress_bar.setRange(0, 100)
+        if self._download_progress_mode == "tiles" and self.tiles_to_download:
+            n = len(self.tiles_to_download)
+            i = self.current_tile_index
+            if total > 0:
+                frac = (i + received / total) / n
+                pct = min(99, int(frac * 100))
+                mb_done = received / (1024 * 1024)
+                mb_total = total / (1024 * 1024)
+                msg = f"Tile {i + 1}/{n}: {mb_done:.1f} / {mb_total:.1f} MB"
+            else:
+                pct = min(99, int(i / n * 100))
+                msg = f"Tile {i + 1}/{n}: downloading..."
+            self._update_download_progress(pct, msg)
+        elif self._download_progress_mode == "single":
+            if total > 0:
+                pct = min(99, int(received * 100 / total))
+                mb_done = received / (1024 * 1024)
+                mb_total = total / (1024 * 1024)
+                self._update_download_progress(
+                    pct, f"Downloading: {mb_done:.1f} / {mb_total:.1f} MB ({pct}%)"
+                )
+            else:
+                self._update_download_progress(
+                    message="Downloading grid from GMRT server..."
+                )
+
     def download_single_grid(self, params, filename, callback=None, requested_format=None):
         """
         Download a single grid file using worker thread.
@@ -978,16 +1125,42 @@ class GMRTGrabber(QWidget):
             requested_format: Not used (kept for compatibility, downloads as GeoTIFF)
         """
         if self.current_worker and self.current_worker.isRunning():
-            return False  # Already downloading
-        
+            self.log_message("Waiting for previous download worker to finish...")
+            if not self.current_worker.wait(5000):
+                self.log_message("Previous download worker did not finish; stopping it")
+                self._disconnect_download_worker_signals()
+                self.current_worker.terminate()
+                self.current_worker.wait(3000)
+            self.current_worker = None
+
+        dest_dir = os.path.dirname(os.path.abspath(filename))
+        if dest_dir:
+            os.makedirs(dest_dir, exist_ok=True)
+
         # Log the request parameters for debugging
         param_str = ", ".join([f"{k}={v}" for k, v in params.items()])
+        request_url = format_gmrt_grid_request_url(params)
         self.log_message(f"Making request (will download as GeoTIFF): {param_str}")
-        
-        self.current_worker = DownloadWorker(params, filename, requested_format)
+        self.log_message(f"GMRT URL: {request_url}")
+        self.log_message(f"Saving to: {filename}")
+        if dest_dir:
+            self.log_message(
+                f"Request log: {os.path.join(dest_dir, GMRT_LOG_FILENAME)}"
+            )
+
+        self.current_worker = DownloadWorker(
+            params, filename, requested_format, log_dir=dest_dir
+        )
+        self.current_worker.progress.connect(
+            self._on_download_byte_progress, Qt.ConnectionType.QueuedConnection
+        )
         if callback:
-            self.current_worker.finished.connect(callback)
+            self.current_worker.finished.connect(
+                callback, Qt.ConnectionType.QueuedConnection
+            )
         self.current_worker.start()
+        if self._download_progress_mode == "tiles":
+            self._start_tile_download_watchdog()
         return True
 
     def download_grid(self):
@@ -1107,13 +1280,21 @@ class GMRTGrabber(QWidget):
         self.log_message(f"Format: {format_type}, Layer: {layer_type_display}, Cell Resolution: {self.mres_combo.currentText()} meters/pixel")
         self.log_message("Parameters validated successfully")
 
-        # Automatically determine if tiling is needed based on 2-degree threshold
         lon_span = abs(east - west)
         lat_span = abs(north - south)
-        needs_tiling = (lat_span > 2.0) or (lon_span > 2.0)
-        
+        mres_value = float(self.mres_combo.currentText())
+        tile_size = tile_size_degrees_for_mres(mres_value)
+        span_sum_limit = 2.0 * tile_size
+        needs_tiling = needs_tiling_for_spans(lon_span, lat_span, mres_value)
+
         if needs_tiling:
-            self.log_message(f"Area exceeds 2-degree threshold (lat: {lat_span:.2f}°, lon: {lon_span:.2f}°), automatically tiling download")
+            self.log_message(
+                f"Tiling required: lon+lat span {lon_span + lat_span:.2f}° exceeds "
+                f"{span_sum_limit:g}° limit ({tile_size:g}° tiles at {mres_value:.0f} m resolution)"
+            )
+            self.log_message(
+                f"  (lon: {lon_span:.2f}°, lat: {lat_span:.2f}°; threshold is sum > 2×tile size)"
+            )
             # Tiled download - automatically mosaic and delete tiles
             # Overlap is now calculated automatically from cell resolution
             tiles = self.generate_tiles(west, east, south, north)
@@ -1133,6 +1314,7 @@ class GMRTGrabber(QWidget):
                     self.status_label.setText("")
                     return
                 self.save_last_download_dir(dir_path)
+                os.makedirs(dir_path, exist_ok=True)
                 self.log_message(f"Selected directory: {dir_path}")
                 
                 self.status_label.setText(f"Downloading {len(tiles)} tiles...")
@@ -1147,13 +1329,34 @@ class GMRTGrabber(QWidget):
                 self.file_ext = file_ext
                 self.current_time = current_time
                 self.success_count = 0
+                self._tile_retry_count = 0
                 self.downloaded_tile_files = []  # Reset tile files list
+
+                mres_log = float(self.mres_combo.currentText())
+                init_gmrt_log_session(
+                    dir_path,
+                    (
+                        f"Tiled download — {len(tiles)} tiles, layer={layer_type}, "
+                        f"mresolution={mres_log:g} m, output format={format_type}"
+                    ),
+                )
+                self.log_message(
+                    f"Tile requests will be logged to {os.path.join(dir_path, GMRT_LOG_FILENAME)}"
+                )
                 
                 self.download_btn.setEnabled(False)  # Disable button during download
+                self._download_progress_mode = "tiles"
+                self._open_download_progress(
+                    "Downloading Tiles",
+                    f"Downloading 1 of {len(tiles)} tiles...",
+                )
                 self.download_next_tile()
         else:
-            # Single download
-            self.log_message("Single file download")
+            # Single download (AOI fits one tile at this resolution)
+            self.log_message(
+                f"Single file download: lon+lat span {lon_span + lat_span:.2f}° is within "
+                f"{span_sum_limit:g}° limit ({tile_size:g}° tile at {mres_value:.0f} m)"
+            )
             self.log_message("Opening directory selection dialog...")
             dir_path = QFileDialog.getExistingDirectory(self, "Select Directory for Grid File", self.last_download_dir)
             if not dir_path:
@@ -1179,7 +1382,9 @@ class GMRTGrabber(QWidget):
 
             self.status_label.setText("Downloading...")
             self.status_label.repaint()
-            
+
+            self._download_progress_mode = "single"
+            self._open_download_progress("Downloading Grid", "Connecting to GMRT server...")
             self.download_btn.setEnabled(False)  # Disable button during download
             self.download_single_grid(params, file_name, self.on_single_download_finished, format_type)
             
@@ -1198,7 +1403,15 @@ class GMRTGrabber(QWidget):
         tile_filename = f"gmrt_{self.layer_type}_{ll_lon}_{ll_lat}_{self.current_tile_index + 1:03d}{tile_ext}"
         tile_path = os.path.join(self.download_dir, tile_filename)
         
-        self.log_message(f"Starting download of tile {self.current_tile_index + 1}/{len(self.tiles_to_download)}: {tile_filename}")
+        tile_num = self.current_tile_index + 1
+        n_tiles = len(self.tiles_to_download)
+        if self._tile_retry_count > 0:
+            self.log_message(
+                f"Retry {self._tile_retry_count}/{TILE_DOWNLOAD_MAX_RETRIES} for tile "
+                f"{tile_num}/{n_tiles}: {tile_filename}"
+            )
+        else:
+            self.log_message(f"Starting download of tile {tile_num}/{n_tiles}: {tile_filename}")
         
         params = {
             "west": tile['west'],
@@ -1211,8 +1424,26 @@ class GMRTGrabber(QWidget):
         
         self.status_label.setText(f"Downloading tile {self.current_tile_index + 1}/{len(self.tiles_to_download)}: {tile_filename}")
         self.status_label.repaint()
-        
-        self.download_single_grid(params, tile_path, self.on_tile_download_finished, self.format_type)
+
+        n = len(self.tiles_to_download)
+        i = self.current_tile_index
+        self._update_download_progress(
+            message=f"Connecting — tile {i + 1}/{n}: {tile_filename}",
+            indeterminate=True,
+        )
+        started = self.download_single_grid(
+            params, tile_path, self.on_tile_download_finished, self.format_type
+        )
+        if not started:
+            self.log_message(
+                f"ERROR: Could not start download for tile {tile_num}/{n_tiles}"
+            )
+            QTimer.singleShot(
+                0,
+                lambda: self.on_tile_download_finished(
+                    False, "Failed to start download worker"
+                ),
+            )
 
     def split_grid_file(self, filename, format_type):
         """
@@ -1379,9 +1610,15 @@ class GMRTGrabber(QWidget):
 
     def on_single_download_finished(self, success, result):
         """Callback for single download completion"""
+        self._stop_tile_download_watchdog()
+        self._disconnect_download_worker_signals()
+        self.current_worker = None
         self.download_btn.setEnabled(True)
         self.download_btn.setText("Download Grid")
         if success:
+            self._update_download_progress(
+                message="Processing downloaded file...", indeterminate=True
+            )
             self.log_message(f"Download completed successfully: {os.path.basename(result)}")
             self.status_label.setText(f"Download complete: {result}")
             # Normalize format type for internal use
@@ -1468,43 +1705,92 @@ class GMRTGrabber(QWidget):
                         result = coards_file
                     else:
                         self.log_message(f"Failed to convert to COARDS, keeping GeoTIFF file")
+            self._update_download_progress(100, "Download complete.")
+            self._close_download_progress()
             QMessageBox.information(self, "Success", f"Grid downloaded to:\n{result}")
         else:
             self.log_message(f"Download failed: {result}")
             self.status_label.setText("Download failed.")
+            self._close_download_progress()
             QMessageBox.critical(self, "Error", f"Failed to download grid:\n{result}")
 
     def on_tile_download_finished(self, success, result):
         """Callback for tile download completion"""
+        self._stop_tile_download_watchdog()
+        self._disconnect_download_worker_signals()
+        self.current_worker = None
         try:
+            tile_num = self.current_tile_index + 1
             if success:
+                self._tile_retry_count = 0
                 self.success_count += 1
                 self.downloaded_tile_files.append(result)  # Track downloaded file
-                self.log_message(f"Tile {self.current_tile_index + 1} downloaded successfully: {os.path.basename(result)}")
-                # Tiles remain as GeoTIFF and only the final mosaic will be converted to the output format
-                # No need to convert individual tiles since they will be automatically mosaicked
+                self.log_message(
+                    f"Tile {tile_num} downloaded successfully: {os.path.basename(result)}"
+                )
             else:
-                self.log_message(f"Tile {self.current_tile_index + 1} failed: {result}")
-            
+                self.log_message(f"Tile {tile_num} failed: {result}")
+                if self._tile_retry_count < TILE_DOWNLOAD_MAX_RETRIES:
+                    self._tile_retry_count += 1
+                    delay_s = TILE_DOWNLOAD_RETRY_DELAY_MS // 1000
+                    self.log_message(
+                        f"Retrying tile {tile_num} in {delay_s}s "
+                        f"(attempt {self._tile_retry_count + 1}/"
+                        f"{TILE_DOWNLOAD_MAX_RETRIES + 1})..."
+                    )
+                    self._update_download_progress(
+                        message=(
+                            f"Tile {tile_num} failed; retry "
+                            f"{self._tile_retry_count}/{TILE_DOWNLOAD_MAX_RETRIES} in {delay_s}s..."
+                        )
+                    )
+                    QTimer.singleShot(TILE_DOWNLOAD_RETRY_DELAY_MS, self.download_next_tile)
+                    return
+
+                self.log_message(
+                    f"Tile {tile_num} failed after {TILE_DOWNLOAD_MAX_RETRIES + 1} attempts; skipping"
+                )
+                self._tile_retry_count = 0
+
             # Move to next tile
             self.current_tile_index += 1
-            
-            # Schedule next download with a 2-second delay
+            n = len(self.tiles_to_download)
+            done = self.current_tile_index
+            if self.download_progress is not None:
+                pct = min(99, int(done / n * 100)) if n else 0
+                self._update_download_progress(
+                    pct, f"Finished {done}/{n} tiles; preparing next..."
+                )
+
             if self.current_tile_index < len(self.tiles_to_download):
-                self.log_message(f"Waiting 2 seconds before downloading tile {self.current_tile_index + 1}")
-                # Use QTimer.singleShot to ensure this runs on the main thread
-                QTimer.singleShot(2000, self.download_next_tile)
+                self.log_message(
+                    f"Waiting {TILE_DOWNLOAD_INTER_TILE_DELAY_MS // 1000} seconds "
+                    f"before downloading tile {self.current_tile_index + 1}"
+                )
+                QTimer.singleShot(TILE_DOWNLOAD_INTER_TILE_DELAY_MS, self.download_next_tile)
             else:
-                # All tiles downloaded, automatically start mosaicking
-                self.log_message(f"All {len(self.tiles_to_download)} tiles completed. Success count: {self.success_count}")
+                # All tile attempts finished — mosaic if any succeeded
+                expected, successful, failed = self._tile_download_counts()
+                self.log_message(
+                    f"Tile download pass finished: {successful}/{expected} succeeded"
+                )
                 self.log_message(f"Downloaded tile files: {self.downloaded_tile_files}")
-                
+
                 if self.downloaded_tile_files:
-                    self.log_message("All tiles downloaded, automatically starting mosaicking process...")
-                    # Use QTimer.singleShot to ensure this runs on the main thread
+                    if failed > 0:
+                        self._log_incomplete_tiles_error("Before mosaicking")
+                        self.log_message(
+                            f"Starting mosaic from {successful} downloaded tile(s) only"
+                        )
+                    else:
+                        self.log_message(
+                            "All tiles downloaded, automatically starting mosaicking process..."
+                        )
                     QTimer.singleShot(3000, self.start_mosaicking)
                 else:
-                    # No tiles downloaded, finish normally
+                    self.log_message(
+                        "ERROR: No tiles were downloaded successfully; skipping mosaic"
+                    )
                     QTimer.singleShot(100, self.finish_tile_download)
                     
         except Exception as e:
@@ -1519,6 +1805,10 @@ class GMRTGrabber(QWidget):
             self.log_message("=== START_MOSAICKING CALLED ===")
             self.status_label.setText("Mosaicking tiles into single GeoTIFF...")
             self.status_label.repaint()
+            self._download_progress_mode = "mosaic"
+            self._update_download_progress(
+                90, "Mosaicking downloaded tiles...", maximum=100
+            )
             self.log_message("Starting mosaicking worker thread...")
 
             # Use rasterio for mosaicking
@@ -1553,6 +1843,7 @@ class GMRTGrabber(QWidget):
         self.log_message(f"Mosaic: {message}")
         self.status_label.setText(f"Mosaicking: {message}")
         self.status_label.repaint()
+        self._update_download_progress(92, f"Mosaicking: {message}")
     
     def on_mosaic_finished(self, success, result):
         """Handle completion of mosaic worker"""
@@ -1657,7 +1948,27 @@ class GMRTGrabber(QWidget):
                     self.download_btn.setText("Download Grid")
                     self.log_message(f"Mosaicking completed successfully: {os.path.basename(mosaic_path)}")
                     self.status_label.setText(f"Mosaic complete: {os.path.basename(mosaic_path)} in {self.download_dir}")
-                    QMessageBox.information(self, "Success", f"Mosaicked {len(self.downloaded_tile_files)} tiles into:\n{mosaic_path}")
+                    self._update_download_progress(100, "Mosaic complete.")
+                    self._close_download_progress()
+                    expected, successful, failed = self._tile_download_counts()
+                    if failed > 0:
+                        self._log_incomplete_tiles_error("After mosaicking")
+                        self.status_label.setText(
+                            f"Mosaic incomplete: {successful}/{expected} tiles in {self.download_dir}"
+                        )
+                        QMessageBox.warning(
+                            self,
+                            "Incomplete Download",
+                            f"Mosaic saved to:\n{mosaic_path}\n\n"
+                            f"Only {successful} of {expected} tiles downloaded successfully "
+                            f"({failed} failed). The mosaic may contain gaps.",
+                        )
+                    else:
+                        QMessageBox.information(
+                            self,
+                            "Success",
+                            f"Mosaicked {successful} tiles into:\n{mosaic_path}",
+                        )
                 else:
                     self.log_message("ERROR: No mosaic path found")
                     self.finish_tile_download()
@@ -1666,6 +1977,7 @@ class GMRTGrabber(QWidget):
                 self.status_label.setText("Mosaicking failed")
                 self.download_btn.setText("Download Grid")
                 self.download_btn.setEnabled(True)
+                self._close_download_progress()
                 QMessageBox.critical(self, "Mosaicking Error", f"Mosaicking failed:\n{result}")
                 self.finish_tile_download()
                 
@@ -1681,9 +1993,38 @@ class GMRTGrabber(QWidget):
         """Finish the tile download process without mosaicking"""
         self.download_btn.setEnabled(True)
         self.download_btn.setText("Download Grid")
-        self.log_message(f"All tiles completed: {self.success_count}/{len(self.tiles_to_download)} successful")
-        self.status_label.setText(f"Download complete: {self.success_count}/{len(self.tiles_to_download)} tiles in {self.download_dir}")
-        QMessageBox.information(self, "Success", f"Downloaded {self.success_count}/{len(self.tiles_to_download)} tiles to:\n{self.download_dir}")
+        expected, successful, failed = self._tile_download_counts()
+        self.log_message(f"Tile download finished: {successful}/{expected} successful")
+        self._close_download_progress()
+
+        if successful == 0:
+            self.log_message("ERROR: No tiles were downloaded successfully")
+            self.status_label.setText("Download failed: no tiles saved")
+            QMessageBox.critical(
+                self,
+                "Download Failed",
+                "No tiles were downloaded successfully.",
+            )
+        elif failed > 0:
+            self._log_incomplete_tiles_error("Download finished")
+            self.status_label.setText(
+                f"Download incomplete: {successful}/{expected} tiles in {self.download_dir}"
+            )
+            QMessageBox.warning(
+                self,
+                "Incomplete Download",
+                f"Only {successful} of {expected} tiles downloaded successfully "
+                f"({failed} failed).\n\nFiles saved to:\n{self.download_dir}",
+            )
+        else:
+            self.status_label.setText(
+                f"Download complete: {successful}/{expected} tiles in {self.download_dir}"
+            )
+            QMessageBox.information(
+                self,
+                "Success",
+                f"Downloaded {successful}/{expected} tiles to:\n{self.download_dir}",
+            )
 
     def validate_bathymetry_data(self, data):
         """
@@ -1975,7 +2316,9 @@ class GMRTGrabber(QWidget):
 
         self.status_label.setText("Downloading...")
         self.status_label.repaint()
-        
+
+        self._download_progress_mode = "single"
+        self._open_download_progress("Downloading Grid", "Connecting to GMRT server...")
         self.download_btn.setEnabled(False)  # Disable button during download
         self.download_single_grid(params, file_name, self.on_single_download_finished, format_type)
 

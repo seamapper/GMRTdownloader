@@ -67,7 +67,9 @@ def _configure_qt_plugins():
 def apply_dark_mode(app):
     """Force dark mode regardless of system theme."""
     app.setStyle("Fusion")
-    app.setStyleSheet(_COMBOBOX_STYLE)
+    # Global QComboBox stylesheet breaks dropdowns on macOS; Mac uses FormSelector instead.
+    if sys.platform != "darwin":
+        app.setStyleSheet(_COMBOBOX_STYLE)
     palette = QPalette()
     # Base colors
     palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))

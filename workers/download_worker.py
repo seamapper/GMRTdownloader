@@ -12,19 +12,30 @@ import shutil
 from PyQt6.QtCore import QThread, pyqtSignal
 import requests
 
-from config import GMRT_URL
+from config import (
+    GMRT_URL,
+    TILE_DOWNLOAD_REQUEST_TIMEOUT,
+    append_gmrt_log,
+    format_gmrt_grid_request_url,
+)
 
 
 class DownloadWorker(QThread):
     """Worker thread for downloading bathymetry data files from GMRT GridServer."""
     finished = pyqtSignal(bool, str)
+    progress = pyqtSignal(int, int)  # bytes_received, total_bytes (-1 if unknown)
 
-    def __init__(self, params, filename, requested_format=None):
+    def __init__(self, params, filename, requested_format=None, log_dir=None):
         super().__init__()
         self.params = params.copy()
         self.params['format'] = 'geotiff'
         self.filename = filename
         self.requested_format = requested_format
+        self.log_dir = log_dir
+
+    def _write_gmrt_log(self, message: str) -> None:
+        if self.log_dir:
+            append_gmrt_log(self.log_dir, message)
 
     def get_error_message(self, status_code):
         error_messages = {
@@ -36,18 +47,25 @@ class DownloadWorker(QThread):
     def run(self):
         try:
             param_str = ", ".join([f"{k}={v}" for k, v in self.params.items()])
+            request_url = format_gmrt_grid_request_url(self.params)
             print(f"[DownloadWorker] Downloading bathymetry grid: {param_str}")
-            with requests.get(GMRT_URL, params=self.params, stream=True, timeout=120) as r:
+            self._write_gmrt_log(f"GET {request_url}")
+            self._write_gmrt_log(f"  save_as: {self.filename}")
+            with requests.get(
+                GMRT_URL, params=self.params, stream=True, timeout=TILE_DOWNLOAD_REQUEST_TIMEOUT
+            ) as r:
                 if r.status_code == 200:
                     temp_geotiff = tempfile.NamedTemporaryFile(suffix='.tif', delete=False)
                     temp_geotiff_path = temp_geotiff.name
                     temp_geotiff.close()
                     total_bytes = 0
+                    expected_total = int(r.headers.get("Content-Length", -1))
                     with open(temp_geotiff_path, 'wb') as f:
                         for chunk in r.iter_content(chunk_size=8192):
                             if chunk:
                                 f.write(chunk)
                                 total_bytes += len(chunk)
+                                self.progress.emit(total_bytes, expected_total)
                     print(f"[DownloadWorker] GeoTIFF download completed successfully ({total_bytes} bytes)")
                     if not os.path.exists(temp_geotiff_path):
                         self.finished.emit(False, f"Temporary GeoTIFF file not found: {temp_geotiff_path}")
@@ -58,6 +76,7 @@ class DownloadWorker(QThread):
                             os.remove(temp_geotiff_path)
                         except Exception:
                             pass
+                        self._write_gmrt_log("  result: FAILED — empty GeoTIFF")
                         self.finished.emit(False, "Downloaded GeoTIFF file is empty")
                         return
                     try:
@@ -72,6 +91,7 @@ class DownloadWorker(QThread):
                             self.finished.emit(False, f"Error saving GeoTIFF file: {e2}")
                             return
                     print(f"[DownloadWorker] Successfully downloaded GeoTIFF file")
+                    self._write_gmrt_log(f"  result: OK ({file_size} bytes)")
                     self.finished.emit(True, self.filename)
                 else:
                     error_msg = self.get_error_message(r.status_code)
@@ -92,13 +112,17 @@ class DownloadWorker(QThread):
                             pass
                     detailed_error = f"Server Error {r.status_code}: {error_msg}"
                     print(f"[DownloadWorker] Grid download failed: {detailed_error}")
+                    self._write_gmrt_log(f"  result: FAILED — {detailed_error}")
                     self.finished.emit(False, detailed_error)
         except requests.exceptions.Timeout:
             print(f"[DownloadWorker] Grid download timeout")
+            self._write_gmrt_log("  result: FAILED — request timeout")
             self.finished.emit(False, "Request Timeout - The server took too long to respond")
         except requests.exceptions.ConnectionError:
             print(f"[DownloadWorker] Grid download connection error")
+            self._write_gmrt_log("  result: FAILED — connection error")
             self.finished.emit(False, "Connection Error - Unable to connect to GMRT server")
         except Exception as e:
             print(f"[DownloadWorker] Grid download error: {str(e)}")
+            self._write_gmrt_log(f"  result: FAILED — {e}")
             self.finished.emit(False, f"Download Error: {str(e)}")
