@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QFormLayout, QCheckBox, QTextEdit, QSplitter, QFrame, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QUrl, QRect, QPoint
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QIcon
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QIcon, QPalette
 import numpy as np
 try:
     import rasterio
@@ -21,6 +21,7 @@ except ImportError:
 from config import (
     __version__,
     GMRT_LOG_FILENAME,
+    MAX_TILES_PER_DOWNLOAD,
     MAP_PREVIEW_MAX_RETRIES,
     MAP_PREVIEW_RETRY_DELAY_MS,
     MAP_PREVIEW_WATCHDOG_MS,
@@ -40,9 +41,8 @@ from ui.map_widget import MapWidget
 from ui.form_selector import FormSelector
 from ui.download_progress_dialog import DownloadProgressDialog
 
-# Activity log colors (dark theme)
-_LOG_COLOR_NORMAL = "#e0e0e0"
-_LOG_COLOR_PROBLEM = "#ff9f43"
+# Activity log colors
+_LOG_COLOR_PROBLEM = "#c45c00"
 
 # Substrings that mark a problem line in the activity log (case-insensitive)
 _LOG_PROBLEM_MARKERS = (
@@ -273,10 +273,34 @@ class GMRTGrabber(QWidget):
         aoi_layout.addLayout(south_row)
 
         # Estimated pixel count (bounds × cell resolution)
+        aoi_info_policy = QSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
+        )
+        aoi_info_align = (
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop
+        )
         self.estimated_pixels_label = QLabel("Est. pixels: —")
-        self.estimated_pixels_label.setWordWrap(True)
-        self.estimated_pixels_label.setStyleSheet("color: #a0a0a0; font-size: 9pt;")
-        aoi_layout.addWidget(self.estimated_pixels_label, 0, Qt.AlignmentFlag.AlignCenter)
+        self.estimated_pixels_label.setWordWrap(False)
+        self.estimated_pixels_label.setSizePolicy(aoi_info_policy)
+        self.estimated_pixels_label.setAlignment(aoi_info_align)
+        self.estimated_pixels_label.setStyleSheet(self._secondary_label_style())
+        aoi_layout.addWidget(self.estimated_pixels_label)
+        self.estimated_tiles_label = QLabel("")
+        self.estimated_tiles_label.setWordWrap(False)
+        self.estimated_tiles_label.setSizePolicy(aoi_info_policy)
+        self.estimated_tiles_label.setAlignment(aoi_info_align)
+        self.estimated_tiles_label.setStyleSheet(self._secondary_label_style())
+        self.estimated_tiles_label.hide()
+        aoi_layout.addWidget(self.estimated_tiles_label)
+        self.estimated_tile_warning_label = QLabel("")
+        self.estimated_tile_warning_label.setWordWrap(True)
+        self.estimated_tile_warning_label.setSizePolicy(aoi_info_policy)
+        self.estimated_tile_warning_label.setAlignment(aoi_info_align)
+        self.estimated_tile_warning_label.setStyleSheet(
+            f"color: {_LOG_COLOR_PROBLEM}; font-size: 9pt;"
+        )
+        self.estimated_tile_warning_label.hide()
+        aoi_layout.addWidget(self.estimated_tile_warning_label)
 
         aoi_group.setLayout(aoi_layout)
         form_layout.addRow(aoi_group)
@@ -384,9 +408,7 @@ class GMRTGrabber(QWidget):
         self.log_area.setMinimumHeight(100)  # Set minimum height for usability
         self.log_area.setReadOnly(True)      # Users can't edit the log
         self.log_area.setFont(QApplication.font())  # Use system font
-        self.log_area.setStyleSheet(
-            f"QTextEdit {{ color: {_LOG_COLOR_NORMAL}; background-color: #2d2d2d; }}"
-        )
+        self.log_area.setStyleSheet("")
         log_layout.addWidget(self.log_area)
         
         # Clear log button - allows users to reset the log
@@ -456,7 +478,7 @@ class GMRTGrabber(QWidget):
         )
         credit_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         credit_label.setWordWrap(True)  # Allow text to wrap to multiple lines
-        credit_label.setStyleSheet("QLabel { color: #a0a0a0; font-size: 9pt; padding: 0px; }")
+        credit_label.setStyleSheet(self._secondary_label_style(padding="0px"))
         credit_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         credit_layout.addWidget(credit_label)
         credit_group.setLayout(credit_layout)
@@ -519,6 +541,61 @@ class GMRTGrabber(QWidget):
         if index >= 0:
             self.update_estimated_pixel_count()
 
+    @staticmethod
+    def _secondary_label_style(padding: str = "") -> str:
+        """Muted label style that follows the system palette."""
+        pal = QApplication.palette()
+        color = pal.color(QPalette.ColorRole.PlaceholderText).name()
+        pad = f" padding: {padding};" if padding else ""
+        return f"QLabel {{ color: {color}; font-size: 9pt;{pad} }}"
+
+    @staticmethod
+    def _log_text_color(is_problem: bool) -> str:
+        if is_problem:
+            return _LOG_COLOR_PROBLEM
+        return QApplication.palette().color(QPalette.ColorRole.Text).name()
+
+    def _compute_tile_counts(
+        self, west: float, east: float, south: float, north: float, cell_m: float
+    ) -> tuple[int, int, int, float, bool]:
+        """
+        Return (n_lon, n_lat, n_tiles, tile_size_deg, needs_tiling) for the current AOI.
+        """
+        lon_span = east - west
+        lat_span = north - south
+        tile_size = tile_size_degrees_for_mres(cell_m)
+        if not needs_tiling_for_spans(lon_span, lat_span, cell_m):
+            return 1, 1, 1, tile_size, False
+        overlap = self.calculate_overlap_from_resolution()
+        n_lon = len(build_degree_strips(west, east, tile_size, overlap))
+        n_lat = len(build_degree_strips(south, north, tile_size, overlap))
+        return n_lon, n_lat, n_lon * n_lat, tile_size, True
+
+    def _sync_download_button_for_tile_limit(self) -> None:
+        """Enable Download only when tile count is within the allowed maximum."""
+        if self.download_btn.text() != "Download Grid":
+            return
+        if self.current_worker and self.current_worker.isRunning():
+            return
+        try:
+            west = self.west_spin.value()
+            east = self.east_spin.value()
+            south = self.south_spin.value()
+            north = self.north_spin.value()
+            if east <= west or north <= south:
+                self.download_btn.setEnabled(True)
+                return
+            cell_m = float(self.mres_combo.currentText())
+            if cell_m <= 0:
+                self.download_btn.setEnabled(True)
+                return
+            _, _, n_tiles, _, _ = self._compute_tile_counts(
+                west, east, south, north, cell_m
+            )
+            self.download_btn.setEnabled(n_tiles <= MAX_TILES_PER_DOWNLOAD)
+        except Exception:
+            self.download_btn.setEnabled(True)
+
     def update_estimated_pixel_count(self):
         """Update the estimated pixel count from current bounds and cell resolution."""
         try:
@@ -528,10 +605,16 @@ class GMRTGrabber(QWidget):
             north = self.north_spin.value()
             if east <= west or north <= south:
                 self.estimated_pixels_label.setText("Est. pixels: —")
+                self.estimated_tiles_label.hide()
+                self.estimated_tile_warning_label.hide()
+                self._sync_download_button_for_tile_limit()
                 return
             cell_m = float(self.mres_combo.currentText())
             if cell_m <= 0:
                 self.estimated_pixels_label.setText("Est. pixels: —")
+                self.estimated_tiles_label.hide()
+                self.estimated_tile_warning_label.hide()
+                self._sync_download_button_for_tile_limit()
                 return
             # Approx meters per degree: lat ~111320 m/deg; lon at center lat = 111320*cos(center_lat)
             center_lat_rad = math.radians((north + south) / 2.0)
@@ -542,24 +625,37 @@ class GMRTGrabber(QWidget):
             width_px = int(round(width_m / cell_m))
             height_px = int(round(height_m / cell_m))
             total = width_px * height_px
-            lon_span = east - west
-            lat_span = north - south
-            tile_size = tile_size_degrees_for_mres(cell_m)
-            if needs_tiling_for_spans(lon_span, lat_span, cell_m):
-                overlap = self.calculate_overlap_from_resolution()
-                n_lon = len(build_degree_strips(west, east, tile_size, overlap))
-                n_lat = len(build_degree_strips(south, north, tile_size, overlap))
-                n_tiles = n_lon * n_lat
-                tile_part = (
-                    f"  ·  Tiles: {n_lon}×{n_lat} ({n_tiles} total) @ {tile_size:g}°"
-                )
-            else:
-                tile_part = f"  ·  Single download ({tile_size:g}° tile)"
-            self.estimated_pixels_label.setText(
-                f"Est. pixels: {width_px:,} × {height_px:,} ({total:,} total){tile_part}"
+            n_lon, n_lat, n_tiles, tile_size, needs_tiling = self._compute_tile_counts(
+                west, east, south, north, cell_m
             )
+            self.estimated_pixels_label.setText(
+                f"Est. pixels: {width_px:,} × {height_px:,} ({total:,} total)"
+            )
+            if needs_tiling:
+                self.estimated_tiles_label.setText(
+                    f"Tiles: {n_lon}×{n_lat} ({n_tiles} total) @ {tile_size:g}°"
+                )
+                self.estimated_tiles_label.show()
+            else:
+                self.estimated_tiles_label.setText(
+                    f"Single download ({tile_size:g}° tile)"
+                )
+                self.estimated_tiles_label.show()
+            if needs_tiling and n_tiles > MAX_TILES_PER_DOWNLOAD:
+                self.estimated_tile_warning_label.setText(
+                    f"Over {MAX_TILES_PER_DOWNLOAD} tiles ({n_tiles}): "
+                    "reduce area or resolution."
+                )
+                self.estimated_tile_warning_label.show()
+                self.estimated_tile_warning_label.adjustSize()
+            else:
+                self.estimated_tile_warning_label.hide()
+            self._sync_download_button_for_tile_limit()
         except Exception:
             self.estimated_pixels_label.setText("Est. pixels: —")
+            self.estimated_tiles_label.hide()
+            self.estimated_tile_warning_label.hide()
+            self._sync_download_button_for_tile_limit()
 
     def _cancel_map_preview_retry(self):
         """Stop pending map preview retries and watchdog."""
@@ -780,7 +876,7 @@ class GMRTGrabber(QWidget):
         """Add a message to the log with timestamp; problems are shown in orange."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         is_problem = self._is_problem_log_message(message) if problem is None else problem
-        color = _LOG_COLOR_PROBLEM if is_problem else _LOG_COLOR_NORMAL
+        color = self._log_text_color(is_problem)
         safe_message = self._escape_log_html(message)
         self.log_area.append(
             f'<span style="color:{color};">[{timestamp}] {safe_message}</span>'
@@ -1176,7 +1272,7 @@ class GMRTGrabber(QWidget):
         except Exception as e:
             self.status_label.setText(f"Log error: {str(e)}")
             self.download_btn.setText("Download Grid")
-            self.download_btn.setEnabled(True)
+            self._sync_download_button_for_tile_limit()
             return
         
         try:
@@ -1184,7 +1280,7 @@ class GMRTGrabber(QWidget):
         except Exception as e:
             self.status_label.setText(f"Log error: {str(e)}")
             self.download_btn.setText("Download Grid")
-            self.download_btn.setEnabled(True)
+            self._sync_download_button_for_tile_limit()
             return
         
         try:
@@ -1192,7 +1288,7 @@ class GMRTGrabber(QWidget):
         except Exception as e:
             self.status_label.setText(f"Log error: {str(e)}")
             self.download_btn.setText("Download Grid")
-            self.download_btn.setEnabled(True)
+            self._sync_download_button_for_tile_limit()
             return
         
         # Get coordinate values
@@ -1206,7 +1302,7 @@ class GMRTGrabber(QWidget):
             self.log_message(f"Error: East ({east}) must be greater than West ({west})")
             self.status_label.setText("Error: East must be greater than West")
             self.download_btn.setText("Download Grid")
-            self.download_btn.setEnabled(True)
+            self._sync_download_button_for_tile_limit()
             QMessageBox.warning(self, "Invalid Coordinates", 
                               f"East coordinate ({east}) must be greater than West coordinate ({west}).\n\n"
                               f"Please correct the coordinates and try again.")
@@ -1216,7 +1312,7 @@ class GMRTGrabber(QWidget):
             self.log_message(f"Error: North ({north}) must be greater than South ({south})")
             self.status_label.setText("Error: North must be greater than South")
             self.download_btn.setText("Download Grid")
-            self.download_btn.setEnabled(True)
+            self._sync_download_button_for_tile_limit()
             QMessageBox.warning(self, "Invalid Coordinates", 
                               f"North coordinate ({north}) must be greater than South coordinate ({south}).\n\n"
                               f"Please correct the coordinates and try again.")
@@ -1227,7 +1323,7 @@ class GMRTGrabber(QWidget):
             self.log_message(f"Error: South latitude ({south}) must be between -85° and 85°")
             self.status_label.setText("Error: South latitude out of range")
             self.download_btn.setText("Download Grid")
-            self.download_btn.setEnabled(True)
+            self._sync_download_button_for_tile_limit()
             QMessageBox.warning(self, "Invalid Coordinates", 
                               f"South latitude ({south}°) must be between -85° and 85° (GMRT data limit).\n\n"
                               f"Please correct the coordinates and try again.")
@@ -1237,7 +1333,7 @@ class GMRTGrabber(QWidget):
             self.log_message(f"Error: North latitude ({north}) must be between -85° and 85°")
             self.status_label.setText("Error: North latitude out of range")
             self.download_btn.setText("Download Grid")
-            self.download_btn.setEnabled(True)
+            self._sync_download_button_for_tile_limit()
             QMessageBox.warning(self, "Invalid Coordinates", 
                               f"North latitude ({north}°) must be between -85° and 85° (GMRT data limit).\n\n"
                               f"Please correct the coordinates and try again.")
@@ -1287,6 +1383,29 @@ class GMRTGrabber(QWidget):
         span_sum_limit = 2.0 * tile_size
         needs_tiling = needs_tiling_for_spans(lon_span, lat_span, mres_value)
 
+        n_lon, n_lat, n_tiles, _, _ = self._compute_tile_counts(
+            west, east, south, north, mres_value
+        )
+        if n_tiles > MAX_TILES_PER_DOWNLOAD:
+            self.log_message(
+                f"ERROR: Tile count {n_tiles} exceeds maximum of "
+                f"{MAX_TILES_PER_DOWNLOAD} ({n_lon}×{n_lat})"
+            )
+            self.status_label.setText(
+                f"Too many tiles ({n_tiles}): reduce area or use coarser resolution"
+            )
+            self.download_btn.setText("Download Grid")
+            self.download_btn.setEnabled(False)
+            QMessageBox.warning(
+                self,
+                "Too Many Tiles",
+                f"This area would require {n_tiles} tiles ({n_lon}×{n_lat}), "
+                f"which exceeds the limit of {MAX_TILES_PER_DOWNLOAD}.\n\n"
+                "Reduce the area of interest or choose a coarser cell resolution, "
+                "then try again.",
+            )
+            return
+
         if needs_tiling:
             self.log_message(
                 f"Tiling required: lon+lat span {lon_span + lat_span:.2f}° exceeds "
@@ -1310,7 +1429,7 @@ class GMRTGrabber(QWidget):
                 if not dir_path:
                     self.log_message("Directory selection cancelled")
                     self.download_btn.setText("Download Grid")
-                    self.download_btn.setEnabled(True)
+                    self._sync_download_button_for_tile_limit()
                     self.status_label.setText("")
                     return
                 self.save_last_download_dir(dir_path)
@@ -1362,7 +1481,7 @@ class GMRTGrabber(QWidget):
             if not dir_path:
                 self.log_message("Directory selection cancelled")
                 self.download_btn.setText("Download Grid")
-                self.download_btn.setEnabled(True)
+                self._sync_download_button_for_tile_limit()
                 self.status_label.setText("")
                 return
             self.save_last_download_dir(dir_path)
@@ -1613,8 +1732,8 @@ class GMRTGrabber(QWidget):
         self._stop_tile_download_watchdog()
         self._disconnect_download_worker_signals()
         self.current_worker = None
-        self.download_btn.setEnabled(True)
         self.download_btn.setText("Download Grid")
+        self._sync_download_button_for_tile_limit()
         if success:
             self._update_download_progress(
                 message="Processing downloaded file...", indeterminate=True
@@ -1944,8 +2063,8 @@ class GMRTGrabber(QWidget):
                             else:
                                 self.log_message(f"Failed to convert mosaic to COARDS, keeping GeoTIFF file")
                     # Finish with success message
-                    self.download_btn.setEnabled(True)
                     self.download_btn.setText("Download Grid")
+                    self._sync_download_button_for_tile_limit()
                     self.log_message(f"Mosaicking completed successfully: {os.path.basename(mosaic_path)}")
                     self.status_label.setText(f"Mosaic complete: {os.path.basename(mosaic_path)} in {self.download_dir}")
                     self._update_download_progress(100, "Mosaic complete.")
@@ -1976,7 +2095,7 @@ class GMRTGrabber(QWidget):
                 self.log_message(f"✗ Mosaicking failed: {result}")
                 self.status_label.setText("Mosaicking failed")
                 self.download_btn.setText("Download Grid")
-                self.download_btn.setEnabled(True)
+                self._sync_download_button_for_tile_limit()
                 self._close_download_progress()
                 QMessageBox.critical(self, "Mosaicking Error", f"Mosaicking failed:\n{result}")
                 self.finish_tile_download()
@@ -1991,8 +2110,8 @@ class GMRTGrabber(QWidget):
 
     def finish_tile_download(self):
         """Finish the tile download process without mosaicking"""
-        self.download_btn.setEnabled(True)
         self.download_btn.setText("Download Grid")
+        self._sync_download_button_for_tile_limit()
         expected, successful, failed = self._tile_download_counts()
         self.log_message(f"Tile download finished: {successful}/{expected} successful")
         self._close_download_progress()
@@ -2268,7 +2387,8 @@ class GMRTGrabber(QWidget):
                 self.split_grid_file(mosaic_path, 'geotiff')
             
             # Finish with success message
-            self.download_btn.setEnabled(True)
+            self.download_btn.setText("Download Grid")
+            self._sync_download_button_for_tile_limit()
             self.log_message(f"Mosaicking completed successfully: {os.path.basename(mosaic_path)}")
             self.status_label.setText(f"Mosaic complete: {os.path.basename(mosaic_path)} in {self.download_dir}")
             QMessageBox.information(self, "Success", f"Mosaicked {len(self.downloaded_tile_files)} tiles into:\n{mosaic_path}")

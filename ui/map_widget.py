@@ -25,7 +25,7 @@ class MapWidget(QWidget):
         self.image_rect = None
         self.cursor_pos = None
         self.setMinimumSize(600, 400)
-        self.setStyleSheet("QWidget { border: 1px solid gray; background-color: #2d2d2d; }")
+        self.setStyleSheet("QWidget { border: 1px solid gray; background-color: #f5f5f5; }")
         self.setMouseTracking(True)
 
     def set_pixmap(self, pixmap):
