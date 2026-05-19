@@ -18,7 +18,12 @@ try:
 except ImportError:
     rasterio = None
 
-from config import __version__
+from config import (
+    __version__,
+    MAP_PREVIEW_MAX_RETRIES,
+    MAP_PREVIEW_RETRY_DELAY_MS,
+    MAP_PREVIEW_WATCHDOG_MS,
+)
 from workers import MapWorker, MosaicWorker, DownloadWorker
 from converters import convert_geotiff_to_netcdf, convert_geotiff_to_coards
 from ui.map_widget import MapWidget
@@ -63,6 +68,16 @@ class GMRTGrabber(QWidget):
         self.map_preview_timer = QTimer()
         self.map_preview_timer.setSingleShot(True)  # Only fire once
         self.map_preview_timer.timeout.connect(self.update_map_preview)
+        # Map preview retry / watchdog (timeouts and failed loads)
+        self._map_preview_retry_count = 0
+        self._map_preview_request_id = 0
+        self._active_map_request_id = 0
+        self.map_preview_retry_timer = QTimer()
+        self.map_preview_retry_timer.setSingleShot(True)
+        self.map_preview_retry_timer.timeout.connect(self._retry_map_preview)
+        self.map_preview_watchdog_timer = QTimer()
+        self.map_preview_watchdog_timer.setSingleShot(True)
+        self.map_preview_watchdog_timer.timeout.connect(self._on_map_preview_watchdog)
         # Configuration and state management
         self.config_file = os.path.join(_project_root(), "gmrtgrab_config.json")
         self.last_download_dir = self.load_last_download_dir()
@@ -118,6 +133,20 @@ class GMRTGrabber(QWidget):
             "Topo-Bathy (Observed Only)": "topo-mask"
         }
         return layer_mapping.get(display_text, display_text)
+
+    @staticmethod
+    def _configure_combo_box(combo: QComboBox) -> None:
+        """Consistent combo setup; avoids macOS popup/focus issues with dark Fusion."""
+        combo.setEditable(False)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        combo.setMinimumContentsLength(8)
+        combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        view = combo.view()
+        if view is not None:
+            view.setMinimumWidth(140)
 
     def save_last_download_dir(self, directory):
         """
@@ -234,14 +263,16 @@ class GMRTGrabber(QWidget):
             "NetCDF",            # NetCDF - Scientific data format with metadata
             "NetCDF (COARDS)"    # COARDS - NetCDF convention for oceanographic/atmospheric data
         ])
+        self._configure_combo_box(self.format_combo)
         grid_form.addRow("Output Format", self.format_combo)
 
         # Cell resolution selection
         # Allows users to specify meter-per-pixel resolution
         self.mres_combo = QComboBox()
         self.mres_combo.addItems(["60", "120", "240", "480", "960"])
-        self.mres_combo.setCurrentText("480")  # Default to 480 meters/pixel
-        self.mres_combo.currentTextChanged.connect(self.update_estimated_pixel_count)
+        self._configure_combo_box(self.mres_combo)
+        self.mres_combo.setCurrentIndex(3)  # 480 m/pixel (index, not setCurrentText — macOS-safe)
+        self.mres_combo.currentIndexChanged.connect(self._on_mres_changed)
         grid_form.addRow("Cell Resolution (meters/pixel)", self.mres_combo)
 
         # Data layer selection
@@ -251,6 +282,7 @@ class GMRTGrabber(QWidget):
             "Topo-Bathy",                    # Topography - Standard bathymetry data
             "Topo-Bathy (Observed Only)"     # Topography with mask - High-resolution data only
         ])
+        self._configure_combo_box(self.layer_combo)
         grid_form.addRow("GMRT Source", self.layer_combo)
 
         # Split Bathymetry/Topography option
@@ -450,6 +482,11 @@ class GMRTGrabber(QWidget):
         self.map_preview_timer.stop()
         self.map_preview_timer.start(500)  # 500ms delay
 
+    def _on_mres_changed(self, index: int) -> None:
+        """Handle cell resolution changes (index-based for reliable macOS updates)."""
+        if index >= 0:
+            self.update_estimated_pixel_count()
+
     def update_estimated_pixel_count(self):
         """Update the estimated pixel count from current bounds and cell resolution."""
         try:
@@ -477,7 +514,61 @@ class GMRTGrabber(QWidget):
         except Exception:
             self.estimated_pixels_label.setText("Est. pixels: —")
 
-    def update_map_preview(self):
+    def _cancel_map_preview_retry(self):
+        """Stop pending map preview retries and watchdog."""
+        self.map_preview_retry_timer.stop()
+        self.map_preview_watchdog_timer.stop()
+
+    def _disconnect_map_worker(self):
+        """Detach signals from the current map worker (abandon hung requests)."""
+        worker = self.current_map_worker
+        if worker is None:
+            return
+        try:
+            worker.map_loaded.disconnect(self.on_map_loaded)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            worker.map_error.disconnect(self.on_map_error)
+        except (TypeError, RuntimeError):
+            pass
+        self.current_map_worker = None
+
+    def _schedule_map_preview_retry(self, reason: str):
+        """Queue another map preview attempt after a delay."""
+        if self._map_preview_retry_count >= MAP_PREVIEW_MAX_RETRIES:
+            self.map_status_label.setText("Map: Error (retries exhausted)")
+            self.log_message("Map preview failed after all retry attempts")
+            self.refresh_map_btn.setEnabled(True)
+            return
+
+        self._map_preview_retry_count += 1
+        delay_s = MAP_PREVIEW_RETRY_DELAY_MS // 1000
+        self.map_status_label.setText(
+            f"Map: Retrying in {delay_s}s ({self._map_preview_retry_count}/{MAP_PREVIEW_MAX_RETRIES})..."
+        )
+        self.log_message(
+            f"Map preview {reason}; retry {self._map_preview_retry_count}/"
+            f"{MAP_PREVIEW_MAX_RETRIES} in {delay_s}s"
+        )
+        self.refresh_map_btn.setEnabled(True)
+        self.map_preview_retry_timer.start(MAP_PREVIEW_RETRY_DELAY_MS)
+
+    def _retry_map_preview(self):
+        """Retry loading the map for the current area of interest."""
+        self.update_map_preview(is_retry=True)
+
+    def _on_map_preview_watchdog(self):
+        """Reload if a preview request produces no result within the watchdog window."""
+        if self._active_map_request_id == 0:
+            return
+        if not self.map_status_label.text().startswith("Map: Loading"):
+            return
+        self.log_message("Map preview watchdog: no response in time")
+        self._disconnect_map_worker()
+        self._schedule_map_preview_retry("timed out")
+
+    def update_map_preview(self, is_retry=False):
         """
         Update the map preview with the current coordinate settings.
         
@@ -485,6 +576,10 @@ class GMRTGrabber(QWidget):
         creates a new worker thread to download the map image, and updates
         the UI to show the loading state.
         """
+        self._cancel_map_preview_retry()
+        if not is_retry:
+            self._map_preview_retry_count = 0
+
         # Validate coordinates first to ensure they make sense
         west = self.west_spin.value()
         east = self.east_spin.value()
@@ -497,11 +592,25 @@ class GMRTGrabber(QWidget):
             return
         
         # Log the map preview request
-        self.log_message(f"Requesting map preview: {west:.4f}°E to {east:.4f}°E, {south:.4f}°N to {north:.4f}°N")
+        attempt = self._map_preview_retry_count + 1
+        if is_retry:
+            self.log_message(
+                f"Retrying map preview (attempt {attempt}): "
+                f"{west:.4f}°E to {east:.4f}°E, {south:.4f}°N to {north:.4f}°N"
+            )
+        else:
+            self.log_message(
+                f"Requesting map preview: {west:.4f}°E to {east:.4f}°E, "
+                f"{south:.4f}°N to {north:.4f}°N"
+            )
         
         # Do not start a new worker if the previous one is still running
         if self.current_map_worker and self.current_map_worker.isRunning():
             return
+
+        self._map_preview_request_id += 1
+        request_id = self._map_preview_request_id
+        self._active_map_request_id = request_id
         
         # Create new map worker with current settings
         self.current_map_worker = MapWorker(
@@ -509,6 +618,7 @@ class GMRTGrabber(QWidget):
             width=800,  # Fixed width for consistent preview quality
             mask=self.mask_checkbox.isChecked()  # Use current mask setting
         )
+        self.current_map_worker.request_id = request_id
         
         # Connect worker signals to UI update methods
         self.current_map_worker.map_loaded.connect(self.on_map_loaded)
@@ -517,9 +627,10 @@ class GMRTGrabber(QWidget):
         # Update UI to show loading state
         self.map_status_label.setText("Map: Loading...")
         self.refresh_map_btn.setEnabled(False)  # Prevent multiple requests
+        self.map_preview_watchdog_timer.start(MAP_PREVIEW_WATCHDOG_MS)
         self.current_map_worker.start()  # Start the background download
     
-    def on_map_loaded(self, pixmap):
+    def on_map_loaded(self, pixmap, request_id=None):
         """
         Handle successful map loading from the worker thread.
         
@@ -529,7 +640,19 @@ class GMRTGrabber(QWidget):
         
         Args:
             pixmap (QPixmap): The loaded map image
+            request_id: Active preview request id (stale responses are ignored)
         """
+        if request_id is None and self.current_map_worker is not None:
+            request_id = getattr(self.current_map_worker, "request_id", None)
+        if request_id is not None and request_id != self._active_map_request_id:
+            return
+
+        self._cancel_map_preview_retry()
+
+        if pixmap.isNull() or pixmap.width() == 0 or pixmap.height() == 0:
+            self._schedule_map_preview_retry("received empty image")
+            return
+
         # Scale the pixmap to fit the label while maintaining aspect ratio
         scaled_pixmap = pixmap.scaled(
             self.map_widget.size(), 
@@ -549,9 +672,10 @@ class GMRTGrabber(QWidget):
         
         self.map_status_label.setText("Map: Loaded")
         self.refresh_map_btn.setEnabled(True)  # Re-enable the refresh button
+        self._map_preview_retry_count = 0
         self.log_message("Map preview updated")
     
-    def on_map_error(self, error_msg):
+    def on_map_error(self, error_msg, request_id=None):
         """
         Handle map loading errors from the worker thread.
         
@@ -560,12 +684,19 @@ class GMRTGrabber(QWidget):
         
         Args:
             error_msg (str): Description of the error that occurred
+            request_id: Active preview request id (stale responses are ignored)
         """
-        # Display error message in the map area
-        self.map_widget.set_pixmap(QPixmap()) # Clear any previous image
-        self.map_status_label.setText("Map: Error")
-        self.refresh_map_btn.setEnabled(True)  # Re-enable the refresh button
+        if request_id is None and self.current_map_worker is not None:
+            request_id = getattr(self.current_map_worker, "request_id", None)
+        if request_id is not None and request_id != self._active_map_request_id:
+            return
+
+        self._cancel_map_preview_retry()
         self.log_message(f"Map preview error: {error_msg}")
+
+        # Keep the previous image if any; schedule a retry for the same AOI
+        self.map_status_label.setText("Map: Error — retrying...")
+        self._schedule_map_preview_retry(error_msg)
 
     def resizeEvent(self, event):
         """

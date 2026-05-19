@@ -5,18 +5,69 @@
 Entry point for GMRT Bathymetry Grid Downloader.
 """
 
+import os
 import sys
 import signal
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QPalette, QColor
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QCoreApplication
 from ui.main_window import GMRTGrabber
+
+# Fusion + dark palette on macOS: native QComboBox popups can be invisible or
+# non-clickable. combobox-popup: 0 forces a Qt-drawn list; explicit colors keep
+# the list readable.
+_COMBOBOX_STYLE = """
+QComboBox {
+    combobox-popup: 0;
+    background-color: #454545;
+    color: #ffffff;
+    border: 1px solid #666666;
+    border-radius: 4px;
+    padding: 4px 8px;
+    min-height: 1.5em;
+}
+QComboBox:hover {
+    border-color: #888888;
+}
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 22px;
+    border-left: 1px solid #666666;
+}
+QComboBox::down-arrow {
+    image: none;
+    width: 0;
+    height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid #cccccc;
+}
+QComboBox QAbstractItemView {
+    background-color: #353535;
+    color: #ffffff;
+    selection-background-color: #2a82da;
+    selection-color: #ffffff;
+    border: 1px solid #666666;
+    outline: none;
+}
+"""
+
+
+def _configure_qt_plugins():
+    """Point Qt at bundled plugins when running as a frozen Mac .app."""
+    if getattr(sys, "frozen", False) and sys.platform == "darwin":
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        plugins = os.path.join(base, "PyQt6", "Qt6", "plugins")
+        if os.path.isdir(plugins):
+            QCoreApplication.setLibraryPaths([plugins])
 
 
 def apply_dark_mode(app):
     """Force dark mode regardless of system theme."""
     app.setStyle("Fusion")
+    app.setStyleSheet(_COMBOBOX_STYLE)
     palette = QPalette()
     # Base colors
     palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
@@ -51,6 +102,7 @@ def main():
         signal.signal(signal.SIGTERM, signal_handler)
 
         print("Starting GMRT Bathymetry Grid Downloader...")
+        _configure_qt_plugins()
         app = QApplication(sys.argv)
         apply_dark_mode(app)
         print("QApplication created successfully")
