@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 import os
+import sys
 import json
 import math
 from datetime import datetime
@@ -42,7 +43,7 @@ from ui.form_selector import FormSelector
 from ui.download_progress_dialog import DownloadProgressDialog
 
 # Activity log colors
-_LOG_COLOR_PROBLEM = "#c45c00"
+_LOG_COLOR_PROBLEM = "#c0392b"
 
 # Substrings that mark a problem line in the activity log (case-insensitive)
 _LOG_PROBLEM_MARKERS = (
@@ -292,16 +293,9 @@ class GMRTGrabber(QWidget):
         self.estimated_tiles_label.setStyleSheet(self._secondary_label_style())
         self.estimated_tiles_label.hide()
         aoi_layout.addWidget(self.estimated_tiles_label)
-        self.estimated_tile_warning_label = QLabel("")
-        self.estimated_tile_warning_label.setWordWrap(True)
-        self.estimated_tile_warning_label.setSizePolicy(aoi_info_policy)
-        self.estimated_tile_warning_label.setAlignment(aoi_info_align)
-        self.estimated_tile_warning_label.setStyleSheet(
-            f"color: {_LOG_COLOR_PROBLEM}; font-size: 9pt;"
-        )
-        self.estimated_tile_warning_label.hide()
-        aoi_layout.addWidget(self.estimated_tile_warning_label)
 
+        self.aoi_group = aoi_group
+        self.aoi_layout = aoi_layout
         aoi_group.setLayout(aoi_layout)
         form_layout.addRow(aoi_group)
 
@@ -506,6 +500,11 @@ class GMRTGrabber(QWidget):
         
         # Log the application startup
         self.log_message("GMRT Bathymetry Grid Downloader started")
+        if sys.platform == "darwin":
+            self.log_message(
+                "macOS detected: pulldown menus use a button-and-menu control "
+                "for compatibility with this platform."
+            )
         self.log_message("Tip: To select an Area of Interest, move the mouse over the map (crosshair cursor) and left-drag to draw a red rectangle; the North/West/East/South fields and estimated pixels will update automatically.")
         
         # Block signals to prevent multiple update_map_preview calls during initial setup
@@ -554,6 +553,42 @@ class GMRTGrabber(QWidget):
         if is_problem:
             return _LOG_COLOR_PROBLEM
         return QApplication.palette().color(QPalette.ColorRole.Text).name()
+
+    def _set_estimated_tiles_line(
+        self,
+        n_lon: int,
+        n_lat: int,
+        n_tiles: int,
+        tile_size: float,
+        *,
+        over_tile_limit: bool,
+    ) -> None:
+        """Line 2: tile count; line 3 (if needed): orange over-limit warning."""
+        label = self.estimated_tiles_label
+        if over_tile_limit:
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.setText(
+                f"Tiles: {n_lon}&times;{n_lat} ({n_tiles} total) @ {tile_size:g}&deg;"
+                f"<br><span style=\"color:{_LOG_COLOR_PROBLEM};\">"
+                f"Over {MAX_TILES_PER_DOWNLOAD} tiles ({n_tiles}): "
+                f"reduce area or resolution.</span>"
+            )
+        else:
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setText(
+                f"Tiles: {n_lon}×{n_lat} ({n_tiles} total) @ {tile_size:g}°"
+            )
+        label.show()
+
+    def _refresh_aoi_info_layout(self) -> None:
+        """Recompute AOI info row heights after text changes."""
+        for widget in (self.estimated_pixels_label, self.estimated_tiles_label):
+            widget.updateGeometry()
+        if hasattr(self, "aoi_layout") and self.aoi_layout is not None:
+            self.aoi_layout.invalidate()
+            self.aoi_layout.activate()
+        if hasattr(self, "aoi_group") and self.aoi_group is not None:
+            self.aoi_group.updateGeometry()
 
     def _compute_tile_counts(
         self, west: float, east: float, south: float, north: float, cell_m: float
@@ -606,14 +641,14 @@ class GMRTGrabber(QWidget):
             if east <= west or north <= south:
                 self.estimated_pixels_label.setText("Est. pixels: —")
                 self.estimated_tiles_label.hide()
-                self.estimated_tile_warning_label.hide()
+                self._refresh_aoi_info_layout()
                 self._sync_download_button_for_tile_limit()
                 return
             cell_m = float(self.mres_combo.currentText())
             if cell_m <= 0:
                 self.estimated_pixels_label.setText("Est. pixels: —")
                 self.estimated_tiles_label.hide()
-                self.estimated_tile_warning_label.hide()
+                self._refresh_aoi_info_layout()
                 self._sync_download_button_for_tile_limit()
                 return
             # Approx meters per degree: lat ~111320 m/deg; lon at center lat = 111320*cos(center_lat)
@@ -632,29 +667,25 @@ class GMRTGrabber(QWidget):
                 f"Est. pixels: {width_px:,} × {height_px:,} ({total:,} total)"
             )
             if needs_tiling:
-                self.estimated_tiles_label.setText(
-                    f"Tiles: {n_lon}×{n_lat} ({n_tiles} total) @ {tile_size:g}°"
+                self._set_estimated_tiles_line(
+                    n_lon,
+                    n_lat,
+                    n_tiles,
+                    tile_size,
+                    over_tile_limit=n_tiles > MAX_TILES_PER_DOWNLOAD,
                 )
-                self.estimated_tiles_label.show()
             else:
+                self.estimated_tiles_label.setTextFormat(Qt.TextFormat.PlainText)
                 self.estimated_tiles_label.setText(
                     f"Single download ({tile_size:g}° tile)"
                 )
                 self.estimated_tiles_label.show()
-            if needs_tiling and n_tiles > MAX_TILES_PER_DOWNLOAD:
-                self.estimated_tile_warning_label.setText(
-                    f"Over {MAX_TILES_PER_DOWNLOAD} tiles ({n_tiles}): "
-                    "reduce area or resolution."
-                )
-                self.estimated_tile_warning_label.show()
-                self.estimated_tile_warning_label.adjustSize()
-            else:
-                self.estimated_tile_warning_label.hide()
+            self._refresh_aoi_info_layout()
             self._sync_download_button_for_tile_limit()
         except Exception:
             self.estimated_pixels_label.setText("Est. pixels: —")
             self.estimated_tiles_label.hide()
-            self.estimated_tile_warning_label.hide()
+            self._refresh_aoi_info_layout()
             self._sync_download_button_for_tile_limit()
 
     def _cancel_map_preview_retry(self):
