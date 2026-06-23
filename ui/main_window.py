@@ -137,6 +137,7 @@ class GMRTGrabber(QWidget):
         self._in_missing_tile_retry_pass = False
         self._missing_tile_pass = 0
         self._retry_pass_total = 0
+        self._last_byte_progress_ms = 0
         self.tile_download_watchdog = QTimer()
         self.tile_download_watchdog.setSingleShot(True)
         self.tile_download_watchdog.timeout.connect(self._on_tile_download_watchdog)
@@ -1187,11 +1188,11 @@ class GMRTGrabber(QWidget):
         except (TypeError, RuntimeError):
             pass
         try:
-            worker.finished.disconnect(self.on_tile_download_finished)
+            worker.download_finished.disconnect(self.on_tile_download_finished)
         except (TypeError, RuntimeError):
             pass
         try:
-            worker.finished.disconnect(self.on_single_download_finished)
+            worker.download_finished.disconnect(self.on_single_download_finished)
         except (TypeError, RuntimeError):
             pass
 
@@ -1219,6 +1220,11 @@ class GMRTGrabber(QWidget):
     def _on_download_byte_progress(self, received: int, total: int) -> None:
         if self.download_progress is None:
             return
+        now_ms = datetime.now().timestamp() * 1000
+        if received > 0 and total > 0 and received < total:
+            if now_ms - self._last_byte_progress_ms < 250:
+                return
+        self._last_byte_progress_ms = now_ms
         if received > 0 and self.download_progress.progress_bar.maximum() == 0:
             self.download_progress.progress_bar.setRange(0, 100)
         if self._download_progress_mode == "tiles" and self.tiles_to_download:
@@ -1289,9 +1295,12 @@ class GMRTGrabber(QWidget):
             self._on_download_byte_progress, Qt.ConnectionType.QueuedConnection
         )
         if callback:
-            self.current_worker.finished.connect(
+            self.current_worker.download_finished.connect(
                 callback, Qt.ConnectionType.QueuedConnection
             )
+        # QThread.finished fires when run() returns; schedule worker cleanup.
+        self.current_worker.finished.connect(self.current_worker.deleteLater)
+        self._last_byte_progress_ms = 0
         self.current_worker.start()
         if self._download_progress_mode == "tiles":
             self._start_tile_download_watchdog()
@@ -2082,7 +2091,10 @@ class GMRTGrabber(QWidget):
                 self.format_type
             )
             self.mosaic_worker.progress.connect(self.on_mosaic_progress)
-            self.mosaic_worker.finished.connect(self.on_mosaic_finished)
+            self.mosaic_worker.mosaic_finished.connect(
+                self.on_mosaic_finished, Qt.ConnectionType.QueuedConnection
+            )
+            self.mosaic_worker.finished.connect(self.mosaic_worker.deleteLater)
             self.mosaic_worker.start()
             
         except Exception as e:

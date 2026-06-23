@@ -70,4 +70,3 @@ class DownloadProgressDialog(QDialog):
             self.status_label.setText(message)
         if value is not None and self.progress_bar.maximum() > 0:
             self.progress_bar.setValue(min(value, self.progress_bar.maximum()))
-        QApplication.processEvents()

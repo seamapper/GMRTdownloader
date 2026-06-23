@@ -25,7 +25,8 @@ except ImportError:
 class MosaicWorker(QThread):
     """Worker thread for handling all mosaicking operations"""
     progress = pyqtSignal(str)
-    finished = pyqtSignal(bool, str)
+    # Do not name this signal "finished" — that shadows QThread.finished and crashes Qt.
+    mosaic_finished = pyqtSignal(bool, str)
 
     def __init__(self, downloaded_tile_files, download_dir, layer_type,
                  west_spin, south_spin,
@@ -217,7 +218,7 @@ class MosaicWorker(QThread):
         try:
             self.progress.emit("Starting mosaicking process...")
             if not self.downloaded_tile_files:
-                self.finished.emit(False, "No tiles to mosaic")
+                self.mosaic_finished.emit(False, "No tiles to mosaic")
                 return
             self.progress.emit(f"Mosaicking {len(self.downloaded_tile_files)} tiles...")
             missing_files = []
@@ -231,10 +232,10 @@ class MosaicWorker(QThread):
                     except Exception:
                         missing_files.append(f)
             if missing_files:
-                self.finished.emit(False, f"Missing or unreadable tile files: {missing_files}")
+                self.mosaic_finished.emit(False, f"Missing or unreadable tile files: {missing_files}")
                 return
             if rasterio is None:
-                self.finished.emit(False, "rasterio not available for mosaicking")
+                self.mosaic_finished.emit(False, "rasterio not available for mosaicking")
                 return
             current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
             mosaic_filename = f"gmrt_{self.layer_type}_mosaic_{current_time}.tif"
@@ -251,7 +252,7 @@ class MosaicWorker(QThread):
                     except Exception:
                         continue
             if not datasets:
-                self.finished.emit(False, "No valid tiles found for mosaicking")
+                self.mosaic_finished.emit(False, "No valid tiles found for mosaicking")
                 return
             self.progress.emit("Using rasterio for mosaicking...")
             fallback_datasets = []
@@ -269,11 +270,11 @@ class MosaicWorker(QThread):
                     original_bounds = (self.west_spin.value(), self.south_spin.value(),
                                      self.east_spin.value(), self.north_spin.value())
                     self._mosaic_with_rasterio_fallback(fallback_datasets, self.mosaic_path, original_bounds)
-                    self.finished.emit(True, "Rasterio mosaicking completed successfully")
+                    self.mosaic_finished.emit(True, "Rasterio mosaicking completed successfully")
                 else:
-                    self.finished.emit(False, "No valid tiles found for fallback")
+                    self.mosaic_finished.emit(False, "No valid tiles found for fallback")
             except Exception as fallback_error:
-                self.finished.emit(False, f"Rasterio fallback also failed: {str(fallback_error)}")
+                self.mosaic_finished.emit(False, f"Rasterio fallback also failed: {str(fallback_error)}")
             finally:
                 for dataset in fallback_datasets:
                     try:
@@ -288,7 +289,7 @@ class MosaicWorker(QThread):
                         pass
         except Exception as e:
             import traceback
-            self.finished.emit(False, f"Mosaic worker error: {str(e)}\n{traceback.format_exc()}")
+            self.mosaic_finished.emit(False, f"Mosaic worker error: {str(e)}\n{traceback.format_exc()}")
 
     def _mosaic_with_rasterio_fallback(self, datasets, mosaic_path, original_bounds):
         from rasterio.warp import reproject, Resampling

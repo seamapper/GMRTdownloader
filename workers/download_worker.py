@@ -22,7 +22,8 @@ from config import (
 
 class DownloadWorker(QThread):
     """Worker thread for downloading bathymetry data files from GMRT GridServer."""
-    finished = pyqtSignal(bool, str)
+    # Do not name this signal "finished" — that shadows QThread.finished and crashes Qt.
+    download_finished = pyqtSignal(bool, str)
     progress = pyqtSignal(int, int)  # bytes_received, total_bytes (-1 if unknown)
 
     def __init__(self, params, filename, requested_format=None, log_dir=None):
@@ -68,7 +69,7 @@ class DownloadWorker(QThread):
                                 self.progress.emit(total_bytes, expected_total)
                     print(f"[DownloadWorker] GeoTIFF download completed successfully ({total_bytes} bytes)")
                     if not os.path.exists(temp_geotiff_path):
-                        self.finished.emit(False, f"Temporary GeoTIFF file not found: {temp_geotiff_path}")
+                        self.download_finished.emit(False, f"Temporary GeoTIFF file not found: {temp_geotiff_path}")
                         return
                     file_size = os.path.getsize(temp_geotiff_path)
                     if file_size == 0:
@@ -77,7 +78,7 @@ class DownloadWorker(QThread):
                         except Exception:
                             pass
                         self._write_gmrt_log("  result: FAILED — empty GeoTIFF")
-                        self.finished.emit(False, "Downloaded GeoTIFF file is empty")
+                        self.download_finished.emit(False, "Downloaded GeoTIFF file is empty")
                         return
                     try:
                         if temp_geotiff_path != self.filename:
@@ -88,11 +89,11 @@ class DownloadWorker(QThread):
                             shutil.copy2(temp_geotiff_path, self.filename)
                             os.remove(temp_geotiff_path)
                         except Exception as e2:
-                            self.finished.emit(False, f"Error saving GeoTIFF file: {e2}")
+                            self.download_finished.emit(False, f"Error saving GeoTIFF file: {e2}")
                             return
                     print(f"[DownloadWorker] Successfully downloaded GeoTIFF file")
                     self._write_gmrt_log(f"  result: OK ({file_size} bytes)")
-                    self.finished.emit(True, self.filename)
+                    self.download_finished.emit(True, self.filename)
                 else:
                     error_msg = self.get_error_message(r.status_code)
                     if r.status_code == 404:
@@ -113,16 +114,16 @@ class DownloadWorker(QThread):
                     detailed_error = f"Server Error {r.status_code}: {error_msg}"
                     print(f"[DownloadWorker] Grid download failed: {detailed_error}")
                     self._write_gmrt_log(f"  result: FAILED — {detailed_error}")
-                    self.finished.emit(False, detailed_error)
+                    self.download_finished.emit(False, detailed_error)
         except requests.exceptions.Timeout:
             print(f"[DownloadWorker] Grid download timeout")
             self._write_gmrt_log("  result: FAILED — request timeout")
-            self.finished.emit(False, "Request Timeout - The server took too long to respond")
+            self.download_finished.emit(False, "Request Timeout - The server took too long to respond")
         except requests.exceptions.ConnectionError:
             print(f"[DownloadWorker] Grid download connection error")
             self._write_gmrt_log("  result: FAILED — connection error")
-            self.finished.emit(False, "Connection Error - Unable to connect to GMRT server")
+            self.download_finished.emit(False, "Connection Error - Unable to connect to GMRT server")
         except Exception as e:
             print(f"[DownloadWorker] Grid download error: {str(e)}")
             self._write_gmrt_log(f"  result: FAILED — {e}")
-            self.finished.emit(False, f"Download Error: {str(e)}")
+            self.download_finished.emit(False, f"Download Error: {str(e)}")
