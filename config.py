@@ -28,6 +28,7 @@ MAP_PREVIEW_WATCHDOG_MS = 35000    # no response watchdog (timeout + buffer)
 # Tiled grid download
 MAX_TILES_PER_DOWNLOAD = 253     # refuse download when tiling would exceed this count
 TILE_DOWNLOAD_MAX_RETRIES = 2      # retries per tile after failure (3 attempts total)
+TILE_DOWNLOAD_MISSING_PASS_MAX = 1  # full passes over failed tiles after initial pass
 TILE_DOWNLOAD_RETRY_DELAY_MS = 5000  # wait before retrying a failed tile
 TILE_DOWNLOAD_INTER_TILE_DELAY_MS = 2000  # wait before starting the next tile
 TILE_DOWNLOAD_REQUEST_TIMEOUT = 120  # seconds per tile HTTP request

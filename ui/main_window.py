@@ -27,6 +27,7 @@ from config import (
     MAP_PREVIEW_RETRY_DELAY_MS,
     MAP_PREVIEW_WATCHDOG_MS,
     TILE_DOWNLOAD_MAX_RETRIES,
+    TILE_DOWNLOAD_MISSING_PASS_MAX,
     TILE_DOWNLOAD_RETRY_DELAY_MS,
     TILE_DOWNLOAD_INTER_TILE_DELAY_MS,
     TILE_DOWNLOAD_WATCHDOG_MS,
@@ -130,6 +131,12 @@ class GMRTGrabber(QWidget):
         self.download_progress = None      # Progress dialog during download/mosaic
         self._download_progress_mode = None  # 'single', 'tiles', or 'mosaic'
         self._tile_retry_count = 0         # retries for the current tile (tiled downloads)
+        self._active_tile_index = 0        # index into tiles_to_download for the current request
+        self._failed_tile_indices: set[int] = set()
+        self._retry_queue: list[int] = []  # tile indices queued for a missing-tile retry pass
+        self._in_missing_tile_retry_pass = False
+        self._missing_tile_pass = 0
+        self._retry_pass_total = 0
         self.tile_download_watchdog = QTimer()
         self.tile_download_watchdog.setSingleShot(True)
         self.tile_download_watchdog.timeout.connect(self._on_tile_download_watchdog)
@@ -1216,7 +1223,7 @@ class GMRTGrabber(QWidget):
             self.download_progress.progress_bar.setRange(0, 100)
         if self._download_progress_mode == "tiles" and self.tiles_to_download:
             n = len(self.tiles_to_download)
-            i = self.current_tile_index
+            i = self._active_tile_index
             if total > 0:
                 frac = (i + received / total) / n
                 pct = min(99, int(frac * 100))
@@ -1480,6 +1487,12 @@ class GMRTGrabber(QWidget):
                 self.current_time = current_time
                 self.success_count = 0
                 self._tile_retry_count = 0
+                self._active_tile_index = 0
+                self._failed_tile_indices = set()
+                self._retry_queue = []
+                self._in_missing_tile_retry_pass = False
+                self._missing_tile_pass = 0
+                self._retry_pass_total = 0
                 self.downloaded_tile_files = []  # Reset tile files list
 
                 mres_log = float(self.mres_combo.currentText())
@@ -1539,30 +1552,51 @@ class GMRTGrabber(QWidget):
             self.download_single_grid(params, file_name, self.on_single_download_finished, format_type)
             
     def download_next_tile(self):
-        """Download the next tile in the sequence"""
-        if self.current_tile_index >= len(self.tiles_to_download):
-            return  # All tiles downloaded
+        """Download the next tile in the sequence, or the next missing tile on a retry pass."""
+        if self._retry_queue:
+            self._active_tile_index = self._retry_queue.pop(0)
+            self._in_missing_tile_retry_pass = True
+        elif self.current_tile_index < len(self.tiles_to_download):
+            self._active_tile_index = self.current_tile_index
+            self._in_missing_tile_retry_pass = False
+        else:
+            return
 
-        tile = self.tiles_to_download[self.current_tile_index]
+        tile = self.tiles_to_download[self._active_tile_index]
         # Use lower left coordinates instead of date/time
         ll_lon = f"{tile['west']:.3f}".replace('-', 'm').replace('.', 'p')
         ll_lat = f"{tile['south']:.3f}".replace('-', 'm').replace('.', 'p')
         # Tiles always use .tif extension (they remain as GeoTIFF)
         # Only the final mosaic will be converted to the output format
         tile_ext = '.tif'
-        tile_filename = f"gmrt_{self.layer_type}_{ll_lon}_{ll_lat}_{self.current_tile_index + 1:03d}{tile_ext}"
+        tile_filename = (
+            f"gmrt_{self.layer_type}_{ll_lon}_{ll_lat}_{self._active_tile_index + 1:03d}{tile_ext}"
+        )
         tile_path = os.path.join(self.download_dir, tile_filename)
-        
-        tile_num = self.current_tile_index + 1
+
+        tile_num = self._active_tile_index + 1
         n_tiles = len(self.tiles_to_download)
-        if self._tile_retry_count > 0:
+        if self._in_missing_tile_retry_pass:
+            retry_pos = self._retry_pass_total - len(self._retry_queue)
+            if self._tile_retry_count > 0:
+                self.log_message(
+                    f"Missing-tile pass {self._missing_tile_pass}: retry "
+                    f"{self._tile_retry_count}/{TILE_DOWNLOAD_MAX_RETRIES} for tile "
+                    f"{tile_num}/{n_tiles} ({retry_pos}/{self._retry_pass_total}): {tile_filename}"
+                )
+            else:
+                self.log_message(
+                    f"Missing-tile pass {self._missing_tile_pass}: retrying tile "
+                    f"{tile_num}/{n_tiles} ({retry_pos}/{self._retry_pass_total}): {tile_filename}"
+                )
+        elif self._tile_retry_count > 0:
             self.log_message(
                 f"Retry {self._tile_retry_count}/{TILE_DOWNLOAD_MAX_RETRIES} for tile "
                 f"{tile_num}/{n_tiles}: {tile_filename}"
             )
         else:
             self.log_message(f"Starting download of tile {tile_num}/{n_tiles}: {tile_filename}")
-        
+
         params = {
             "west": tile['west'],
             "east": tile['east'],
@@ -1571,14 +1605,23 @@ class GMRTGrabber(QWidget):
             "layer": self.layer_type,
             "mresolution": float(self.mres_combo.currentText())
         }
-        
-        self.status_label.setText(f"Downloading tile {self.current_tile_index + 1}/{len(self.tiles_to_download)}: {tile_filename}")
+
+        self.status_label.setText(
+            f"Downloading tile {tile_num}/{n_tiles}: {tile_filename}"
+        )
         self.status_label.repaint()
 
         n = len(self.tiles_to_download)
-        i = self.current_tile_index
+        i = self._active_tile_index
+        progress_msg = f"Connecting — tile {i + 1}/{n}: {tile_filename}"
+        if self._in_missing_tile_retry_pass:
+            retry_pos = self._retry_pass_total - len(self._retry_queue)
+            progress_msg = (
+                f"Retry pass {self._missing_tile_pass} — tile {i + 1}/{n} "
+                f"({retry_pos}/{self._retry_pass_total}): {tile_filename}"
+            )
         self._update_download_progress(
-            message=f"Connecting — tile {i + 1}/{n}: {tile_filename}",
+            message=progress_msg,
             indeterminate=True,
         )
         started = self.download_single_grid(
@@ -1864,15 +1907,70 @@ class GMRTGrabber(QWidget):
             self._close_download_progress()
             QMessageBox.critical(self, "Error", f"Failed to download grid:\n{result}")
 
+    def _schedule_next_tile_download(self, delay_ms: int | None = None) -> None:
+        """Queue the next tile download after a short delay."""
+        if delay_ms is None:
+            delay_ms = TILE_DOWNLOAD_INTER_TILE_DELAY_MS
+        QTimer.singleShot(delay_ms, self.download_next_tile)
+
+    def _on_all_tiles_pass_finished(self) -> None:
+        """After a full pass, retry missing tiles or proceed to mosaicking."""
+        if (
+            self._failed_tile_indices
+            and self._missing_tile_pass < TILE_DOWNLOAD_MISSING_PASS_MAX
+        ):
+            self._missing_tile_pass += 1
+            self._retry_queue = sorted(self._failed_tile_indices)
+            self._failed_tile_indices = set()
+            self._retry_pass_total = len(self._retry_queue)
+            delay_s = TILE_DOWNLOAD_RETRY_DELAY_MS // 1000
+            self.log_message(
+                f"Initial pass complete; retrying {self._retry_pass_total} missing tile(s) "
+                f"in pass {self._missing_tile_pass}/{TILE_DOWNLOAD_MISSING_PASS_MAX} "
+                f"after {delay_s}s..."
+            )
+            self._update_download_progress(
+                message=(
+                    f"Retrying {self._retry_pass_total} missing tile(s) "
+                    f"in {delay_s}s..."
+                )
+            )
+            self._schedule_next_tile_download(TILE_DOWNLOAD_RETRY_DELAY_MS)
+            return
+
+        expected, successful, failed = self._tile_download_counts()
+        self.log_message(
+            f"Tile download pass finished: {successful}/{expected} succeeded"
+        )
+        self.log_message(f"Downloaded tile files: {self.downloaded_tile_files}")
+
+        if self.downloaded_tile_files:
+            if failed > 0:
+                self._log_incomplete_tiles_error("Before mosaicking")
+                self.log_message(
+                    f"Starting mosaic from {successful} downloaded tile(s) only"
+                )
+            else:
+                self.log_message(
+                    "All tiles downloaded, automatically starting mosaicking process..."
+                )
+            QTimer.singleShot(3000, self.start_mosaicking)
+        else:
+            self.log_message(
+                "ERROR: No tiles were downloaded successfully; skipping mosaic"
+            )
+            QTimer.singleShot(100, self.finish_tile_download)
+
     def on_tile_download_finished(self, success, result):
         """Callback for tile download completion"""
         self._stop_tile_download_watchdog()
         self._disconnect_download_worker_signals()
         self.current_worker = None
         try:
-            tile_num = self.current_tile_index + 1
+            tile_num = self._active_tile_index + 1
             if success:
                 self._tile_retry_count = 0
+                self._failed_tile_indices.discard(self._active_tile_index)
                 self.success_count += 1
                 self.downloaded_tile_files.append(result)  # Track downloaded file
                 self.log_message(
@@ -1894,55 +1992,60 @@ class GMRTGrabber(QWidget):
                             f"{self._tile_retry_count}/{TILE_DOWNLOAD_MAX_RETRIES} in {delay_s}s..."
                         )
                     )
-                    QTimer.singleShot(TILE_DOWNLOAD_RETRY_DELAY_MS, self.download_next_tile)
+                    self._schedule_next_tile_download(TILE_DOWNLOAD_RETRY_DELAY_MS)
                     return
 
                 self.log_message(
                     f"Tile {tile_num} failed after {TILE_DOWNLOAD_MAX_RETRIES + 1} attempts; skipping"
                 )
+                self._failed_tile_indices.add(self._active_tile_index)
                 self._tile_retry_count = 0
 
-            # Move to next tile
-            self.current_tile_index += 1
             n = len(self.tiles_to_download)
-            done = self.current_tile_index
-            if self.download_progress is not None:
-                pct = min(99, int(done / n * 100)) if n else 0
-                self._update_download_progress(
-                    pct, f"Finished {done}/{n} tiles; preparing next..."
+            if self._retry_queue:
+                done = self.success_count
+                if self.download_progress is not None:
+                    pct = min(99, int(done / n * 100)) if n else 0
+                    self._update_download_progress(
+                        pct, f"Finished {done}/{n} tiles; preparing next retry..."
+                    )
+                self.log_message(
+                    f"Waiting {TILE_DOWNLOAD_INTER_TILE_DELAY_MS // 1000} seconds "
+                    f"before retrying next missing tile"
                 )
-
-            if self.current_tile_index < len(self.tiles_to_download):
+                self._schedule_next_tile_download()
+            elif self._in_missing_tile_retry_pass:
+                if self.download_progress is not None:
+                    done = self.success_count
+                    pct = min(99, int(done / n * 100)) if n else 0
+                    self._update_download_progress(
+                        pct, f"Finished {done}/{n} tiles; checking for more retries..."
+                    )
+                self._in_missing_tile_retry_pass = False
+                self._on_all_tiles_pass_finished()
+            elif self.current_tile_index + 1 < n:
+                self.current_tile_index += 1
+                done = self.current_tile_index
+                if self.download_progress is not None:
+                    pct = min(99, int(done / n * 100)) if n else 0
+                    self._update_download_progress(
+                        pct, f"Finished {done}/{n} tiles; preparing next..."
+                    )
                 self.log_message(
                     f"Waiting {TILE_DOWNLOAD_INTER_TILE_DELAY_MS // 1000} seconds "
                     f"before downloading tile {self.current_tile_index + 1}"
                 )
-                QTimer.singleShot(TILE_DOWNLOAD_INTER_TILE_DELAY_MS, self.download_next_tile)
+                self._schedule_next_tile_download()
             else:
-                # All tile attempts finished — mosaic if any succeeded
-                expected, successful, failed = self._tile_download_counts()
-                self.log_message(
-                    f"Tile download pass finished: {successful}/{expected} succeeded"
-                )
-                self.log_message(f"Downloaded tile files: {self.downloaded_tile_files}")
-
-                if self.downloaded_tile_files:
-                    if failed > 0:
-                        self._log_incomplete_tiles_error("Before mosaicking")
-                        self.log_message(
-                            f"Starting mosaic from {successful} downloaded tile(s) only"
-                        )
-                    else:
-                        self.log_message(
-                            "All tiles downloaded, automatically starting mosaicking process..."
-                        )
-                    QTimer.singleShot(3000, self.start_mosaicking)
-                else:
-                    self.log_message(
-                        "ERROR: No tiles were downloaded successfully; skipping mosaic"
+                self.current_tile_index = n
+                if self.download_progress is not None:
+                    done = self.success_count
+                    pct = min(99, int(done / n * 100)) if n else 0
+                    self._update_download_progress(
+                        pct, f"Finished {done}/{n} tiles; checking for missing tiles..."
                     )
-                    QTimer.singleShot(100, self.finish_tile_download)
-                    
+                self._on_all_tiles_pass_finished()
+
         except Exception as e:
             import traceback
             self.log_message(f"ERROR in on_tile_download_finished: {str(e)}")
